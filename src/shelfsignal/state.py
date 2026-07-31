@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import sqlite3
+import stat
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -39,11 +41,44 @@ def _url_hash(url: str) -> str:
     return hashlib.sha256(url.encode("utf-8")).hexdigest()
 
 
+class StateError(ValueError):
+    pass
+
+
 class StateStore:
     def __init__(self, path: Path):
         self.path = path
 
+    def _prepare_database_file(self) -> None:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            mode = self.path.lstat().st_mode
+        except FileNotFoundError:
+            try:
+                descriptor = os.open(
+                    self.path,
+                    os.O_RDWR | os.O_CREAT | os.O_EXCL | no_follow,
+                    0o600,
+                )
+            except OSError as exc:
+                raise StateError(f"cannot securely create state database: {self.path}") from exc
+        else:
+            if not stat.S_ISREG(mode):
+                raise StateError(f"state database path is not a regular file: {self.path}")
+            try:
+                descriptor = os.open(self.path, os.O_RDWR | no_follow)
+            except OSError as exc:
+                raise StateError(f"state database path is unsafe: {self.path}") from exc
+
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise StateError(f"state database path is not a regular file: {self.path}")
+            os.fchmod(descriptor, 0o600)
+        finally:
+            os.close(descriptor)
+
     def _connect(self) -> sqlite3.Connection:
+        self._prepare_database_file()
         connection = sqlite3.connect(self.path)
         connection.row_factory = sqlite3.Row
         return connection
