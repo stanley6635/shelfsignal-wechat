@@ -275,3 +275,40 @@ def initialize_workspace(root: Path) -> WorkspacePaths:
         for descriptor in reversed(descriptors):
             os.close(descriptor)
     return paths
+
+
+def validate_existing_workspace(root: Path) -> WorkspacePaths:
+    expanded_root = root.expanduser()
+    if expanded_root.is_symlink():
+        raise WorkspaceError(f"managed workspace path is a symbolic link: {root}")
+
+    paths = WorkspacePaths.from_root(expanded_root)
+    if _inside_git_repository(paths.root):
+        raise WorkspaceError(
+            "refusing to use a private workspace inside a Git repository"
+        )
+    _validate_managed_paths(paths)
+
+    required_directories = _managed_directories(paths)
+    required_files = (paths.interests, paths.rubric)
+    try:
+        directory_modes = tuple(path.lstat().st_mode for path in required_directories)
+        file_modes = tuple(path.lstat().st_mode for path in required_files)
+    except FileNotFoundError as exc:
+        raise WorkspaceError(
+            f"not an initialized ShelfSignal workspace: {paths.root}"
+        ) from exc
+    except OSError as exc:
+        raise WorkspaceError(f"cannot validate ShelfSignal workspace: {paths.root}") from exc
+
+    if not all(stat.S_ISDIR(mode) for mode in directory_modes):
+        raise WorkspaceError(
+            f"not an initialized ShelfSignal workspace: {paths.root}"
+        )
+    if not all(stat.S_ISREG(mode) for mode in file_modes):
+        raise WorkspaceError(
+            f"not an initialized ShelfSignal workspace: {paths.root}"
+        )
+    if paths.state_db.exists() and not stat.S_ISREG(paths.state_db.lstat().st_mode):
+        raise WorkspaceError(f"managed workspace file is unsafe: {paths.state_db}")
+    return paths
