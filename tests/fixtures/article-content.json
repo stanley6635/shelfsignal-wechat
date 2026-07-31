@@ -1,0 +1,5 @@
+{
+  "reviewId": "MP_DEMO_ARTICLE",
+  "content": "<p>Fictional article body.</p><img src=\"https://example.invalid/image-001.jpg\">",
+  "images": ["https://example.invalid/image-001.jpg"]
+}

@@ -24,6 +24,19 @@ class RemoteArticle:
 
 
 @dataclass(frozen=True)
+class ShelfAccount:
+    account_id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class ArticleContent:
+    article_id: str
+    html: str
+    image_urls: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class StoredArticle:
     article: RemoteArticle
     directory: Path
