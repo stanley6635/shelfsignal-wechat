@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .workspace import initialize_workspace
+from .workspace import WorkspaceError, initialize_workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -23,7 +24,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except SystemExit as exc:
         return int(exc.code)
     if args.command == "init":
-        paths = initialize_workspace(args.workspace)
+        try:
+            paths = initialize_workspace(args.workspace)
+        except WorkspaceError as exc:
+            print(f"shelfsignal: {exc}", file=sys.stderr)
+            return 1
         print(paths.root)
     return 0
 
