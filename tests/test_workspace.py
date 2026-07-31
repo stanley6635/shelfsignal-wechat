@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import shelfsignal.workspace as workspace_module
 from shelfsignal.workspace import WorkspaceError, WorkspacePaths, initialize_workspace
 
 
@@ -37,6 +38,36 @@ def test_initialize_workspace_rejects_directory_symlink_escape(tmp_path: Path):
     with pytest.raises(WorkspaceError, match="symbolic link"):
         initialize_workspace(root)
 
+    assert list(outside.iterdir()) == []
+
+
+def test_initialize_workspace_does_not_follow_profile_swapped_after_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    root = tmp_path / "ShelfSignal-Data"
+    profile = root / "profile"
+    outside = tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    original_open = workspace_module.os.open
+    swapped = False
+
+    def open_and_swap_profile(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal swapped
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        is_profile = path == profile or (path == "profile" and dir_fd is not None)
+        if is_profile and not swapped:
+            swapped = True
+            profile.rmdir()
+            profile.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr(workspace_module.os, "open", open_and_swap_profile)
+
+    with pytest.raises(WorkspaceError):
+        initialize_workspace(root)
+
+    assert swapped
     assert list(outside.iterdir()) == []
 
 
