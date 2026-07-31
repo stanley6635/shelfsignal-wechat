@@ -4,6 +4,8 @@ import hashlib
 import os
 import sqlite3
 import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -83,26 +85,35 @@ class StateStore:
         connection.row_factory = sqlite3.Row
         return connection
 
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
     def initialize(self) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.executescript(SCHEMA)
 
     def start_run(self, run_id: str, auth_policy: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "INSERT INTO runs VALUES (?, ?, NULL, ?, ?)",
                 (run_id, _now(), auth_policy, "running"),
             )
 
     def finish_run(self, run_id: str, status: str) -> None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 "UPDATE runs SET finished_at = ?, status = ? WHERE run_id = ?",
                 (_now(), status, run_id),
             )
 
     def run_status(self, run_id: str) -> str | None:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT status FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
@@ -116,7 +127,7 @@ class StateStore:
         run_id: str,
     ) -> None:
         now = _now()
-        with self._connect() as connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO articles (
@@ -144,7 +155,7 @@ class StateStore:
             )
 
     def is_complete(self, article_id: str, source_sha256: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT source_sha256, status FROM articles WHERE article_id = ?",
                 (article_id,),
@@ -156,7 +167,7 @@ class StateStore:
         )
 
     def is_known_url(self, source_url: str) -> bool:
-        with self._connect() as connection:
+        with self._connection() as connection:
             row = connection.execute(
                 "SELECT 1 FROM articles WHERE source_url_hash = ? AND status = ?",
                 (_url_hash(source_url), ArticleStatus.COMPLETE.value),
@@ -164,7 +175,7 @@ class StateStore:
         return row is not None
 
     def article_ids_for_run(self, run_id: str) -> tuple[str, ...]:
-        with self._connect() as connection:
+        with self._connection() as connection:
             rows = connection.execute(
                 "SELECT article_id FROM articles WHERE run_id = ? ORDER BY article_id",
                 (run_id,),
