@@ -203,3 +203,40 @@ def test_seed_normalizes_markup_and_sentence_delimiters_but_keeps_query(
         ),
     ):
         assert store.is_known_url(url)
+
+
+@pytest.mark.parametrize(
+    "terminal_delimiter",
+    [
+        "]",
+        '"',
+        "'",
+        "`",
+        "）",
+        "】",
+        "》",
+        "〉",
+        "」",
+        "』",
+        "”",
+        "’",
+        "、",
+        ".",
+        "。",
+    ],
+)
+def test_seed_removes_terminal_wrappers_from_url_fingerprint(
+    tmp_path: Path, terminal_delimiter: str
+):
+    clean_url = "https://example.invalid/wechat/wrapped?from=archive&kind=full"
+    corrupted_url = f"{clean_url}{terminal_delimiter}"
+    archive = tmp_path / "archive.md"
+    archive.write_text(f"原文（{corrupted_url}\n", encoding="utf-8")
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+
+    result = seed_markdown_archive(archive, store)
+
+    assert result.imported == 1
+    assert store.is_known_url(clean_url)
+    assert not store.is_known_url(corrupted_url)

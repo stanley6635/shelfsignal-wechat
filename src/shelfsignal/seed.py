@@ -9,7 +9,7 @@ from pathlib import Path
 from .state import StateStore
 
 URL_PATTERN = re.compile(r"https?://[^\s)>]+")
-SENTENCE_SUFFIXES = ".,;，。；：！？"
+TERMINAL_DELIMITERS = ".,;]\"'`，。；：！？、）】》〉」』”’"
 EMPHASIS_DELIMITERS = ("**", "__", "~~", "*", "_", "~")
 
 
@@ -91,13 +91,13 @@ def _read_markdown(path: Path) -> str:
 def _normalized_urls(text: str) -> tuple[str, ...]:
     urls: list[str] = []
     for match in URL_PATTERN.finditer(text):
-        url = match.group().rstrip(SENTENCE_SUFFIXES)
+        url = match.group().rstrip(TERMINAL_DELIMITERS)
         prefix = text[: match.start()]
         for delimiter in EMPHASIS_DELIMITERS:
             if prefix.endswith(delimiter) and url.endswith(delimiter):
                 url = url[: -len(delimiter)]
                 break
-        url = url.rstrip(SENTENCE_SUFFIXES)
+        url = url.rstrip(TERMINAL_DELIMITERS)
         if url:
             urls.append(url)
     return tuple(dict.fromkeys(urls))
