@@ -6,7 +6,9 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from . import __version__
-from .workspace import WorkspaceError, initialize_workspace
+from .seed import seed_markdown_archive
+from .state import StateStore
+from .workspace import WorkspaceError, WorkspacePaths, initialize_workspace
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -15,6 +17,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
     init_parser = subparsers.add_parser("init")
     init_parser.add_argument("workspace", type=Path)
+    seed_parser = subparsers.add_parser("seed")
+    seed_parser.add_argument("--workspace", type=Path, required=True)
+    seed_parser.add_argument("archive", type=Path)
     return parser
 
 
@@ -30,6 +35,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(f"shelfsignal: {exc}", file=sys.stderr)
             return 1
         print(paths.root)
+    if args.command == "seed":
+        paths = WorkspacePaths.from_root(args.workspace)
+        store = StateStore(paths.state_db)
+        store.initialize()
+        result = seed_markdown_archive(args.archive, store)
+        print(
+            f"scanned={result.scanned_files} "
+            f"discovered={result.discovered} imported={result.imported}"
+        )
     return 0
 
 

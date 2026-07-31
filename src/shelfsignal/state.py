@@ -97,6 +97,45 @@ class StateStore:
     def initialize(self) -> None:
         with self._connection() as connection:
             connection.executescript(SCHEMA)
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO runs
+                (run_id, started_at, finished_at, auth_policy, status)
+                VALUES ('historical-seed', ?, ?, 'none', 'complete')
+                """,
+                (_now(), _now()),
+            )
+
+    def seed_url(self, source_url: str) -> bool:
+        source_url_hash = _url_hash(source_url)
+        article_id = f"url-{source_url_hash[:24]}"
+        now = _now()
+        with self._connection() as connection:
+            existing = connection.execute(
+                "SELECT 1 FROM articles WHERE article_id = ?", (article_id,)
+            ).fetchone()
+            if existing:
+                return False
+            connection.execute(
+                """
+                INSERT INTO articles (
+                    article_id, source_sha256, source_url_hash, account_id,
+                    published_at, first_seen_at, last_seen_at, status, run_id
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    article_id,
+                    source_url_hash,
+                    source_url_hash,
+                    "historical-seed",
+                    "1970-01-01T00:00:00+00:00",
+                    now,
+                    now,
+                    ArticleStatus.COMPLETE.value,
+                    "historical-seed",
+                ),
+            )
+        return True
 
     def start_run(self, run_id: str, auth_policy: str) -> None:
         with self._connection() as connection:
