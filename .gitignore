@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Never commit a runtime workspace.
+.shelfsignal/
+ShelfSignal-Data/
+browser/
+library/
+runs/
+briefings/
+exports/
+state.db
