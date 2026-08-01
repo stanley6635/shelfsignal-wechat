@@ -1,11 +1,176 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from html.parser import HTMLParser
+from typing import Protocol
 from urllib.parse import urlsplit
 
-from .errors import ContentContractUnavailable, ShelfUnavailable
+from playwright.async_api import BrowserContext, Page
+
+from .content import _safe_https_url
+from .errors import ArticleBodyUnavailable, ContentContractUnavailable, ShelfUnavailable
 from .models import ArticleContent, RemoteArticle, ShelfAccount
+
+SHELF_URL = "https://weread.qq.com/web/shelf"
+BOOK_READ_URL = "https://weread.qq.com/web/book/read"
+MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
+MAX_ASSET_BYTES = 25 * 1024 * 1024
+
+_MIME_KINDS = {
+    "image/avif": {"avif"},
+    "image/bmp": {"bmp"},
+    "image/gif": {"gif"},
+    "image/heic": {"heic"},
+    "image/heif": {"heic"},
+    "image/jpeg": {"jpeg"},
+    "image/jpg": {"jpeg"},
+    "image/png": {"png"},
+    "image/tiff": {"tiff"},
+    "image/webp": {"webp"},
+}
+
+
+class ArticleClient(Protocol):
+    async def shelf(self) -> tuple[ShelfAccount, ...]: ...
+
+    async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]: ...
+
+    async def content(self, article: RemoteArticle) -> ArticleContent: ...
+
+    async def asset(self, url: str) -> bytes: ...
+
+
+class PlaywrightWeReadClient:
+    def __init__(self, context: BrowserContext, page: Page):
+        self.context = context
+        self.page = page
+
+    async def shelf(self) -> tuple[ShelfAccount, ...]:
+        try:
+            response = await self.page.goto(SHELF_URL, wait_until="domcontentloaded")
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ShelfUnavailable("saved shelf request failed") from exc
+        if response is None or not response.ok:
+            status = "no response" if response is None else f"HTTP {response.status}"
+            raise ShelfUnavailable(f"saved shelf request failed: {status}")
+        try:
+            html = await self.page.content()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ShelfUnavailable("saved shelf content could not be read") from exc
+        return parse_shelf_html(html)
+
+    async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
+        response = await self.context.request.post(
+            BOOK_READ_URL,
+            data={"bookId": account.account_id},
+        )
+        if not response.ok:
+            raise ContentContractUnavailable(
+                f"book/read returned HTTP {response.status}"
+            )
+        return parse_book_read(await _response_json(response, "book/read"), account)
+
+    async def content(self, article: RemoteArticle) -> ArticleContent:
+        response = await self.context.request.get(
+            MP_CONTENT_URL,
+            params={"reviewId": article.article_id},
+        )
+        if response.status == 404:
+            raise ArticleBodyUnavailable(
+                f"article body unavailable: {article.article_id}"
+            )
+        if not response.ok:
+            raise ContentContractUnavailable(
+                f"mp/content returned HTTP {response.status}"
+            )
+        content = parse_article_content(await _response_json(response, "mp/content"))
+        if content.article_id != article.article_id:
+            raise ContentContractUnavailable("article content ID does not match request")
+        return content
+
+    async def asset(self, url: str) -> bytes:
+        if not _safe_https_url(url, image=True):
+            raise OSError("unsafe asset URL")
+        response = await self.context.request.get(url)
+        status = getattr(response, "status", None)
+        ok = getattr(response, "ok", None)
+        headers = getattr(response, "headers", None)
+        if type(status) is not int or not isinstance(ok, bool) or not isinstance(headers, dict):
+            raise OSError("asset returned an invalid response type")
+        if not ok:
+            raise OSError(f"asset returned HTTP {status}")
+        final_url = getattr(response, "url", "")
+        if not isinstance(final_url, str) or not _safe_https_url(final_url, image=True):
+            raise OSError("asset returned an unsafe final URL")
+
+        raw_content_type = headers.get("content-type", "")
+        if not isinstance(raw_content_type, str):
+            raise OSError("asset returned an unsupported content type")
+        content_type = raw_content_type.split(";", 1)[0].strip().lower()
+        expected_kinds = _MIME_KINDS.get(content_type)
+        if expected_kinds is None:
+            raise OSError("asset returned an unsupported content type")
+        content_length = headers.get("content-length")
+        if content_length is not None and not isinstance(content_length, str):
+            raise OSError("asset returned an invalid content length")
+        _validate_content_length(content_length)
+
+        body = await response.body()
+        if not isinstance(body, bytes):
+            raise OSError("asset returned an invalid response body")
+        if len(body) > MAX_ASSET_BYTES:
+            raise OSError("asset exceeds the download size limit")
+        kind = _raster_kind(body)
+        if kind is None or kind not in expected_kinds:
+            raise OSError("asset content signature does not match its content type")
+        return body
+
+
+async def _response_json(response: object, label: str) -> object:
+    try:
+        return await response.json()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise ContentContractUnavailable(f"{label} returned invalid JSON") from exc
+
+
+def _validate_content_length(value: str | None) -> None:
+    if value is None:
+        return
+    try:
+        size = int(value)
+    except (TypeError, ValueError) as exc:
+        raise OSError("asset returned an invalid content length") from exc
+    if size < 0 or size > MAX_ASSET_BYTES:
+        raise OSError("asset exceeds the download size limit")
+
+
+def _raster_kind(content: bytes) -> str | None:
+    if content.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if content.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if content.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if len(content) >= 12 and content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "webp"
+    if content.startswith(b"BM"):
+        return "bmp"
+    if content.startswith((b"II*\x00", b"MM\x00*")):
+        return "tiff"
+    if len(content) >= 12 and content[4:8] == b"ftyp":
+        brand = content[8:12]
+        if brand in {b"avif", b"avis"}:
+            return "avif"
+        if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
+            return "heic"
+    return None
 
 
 class _ShelfParser(HTMLParser):

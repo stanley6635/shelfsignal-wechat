@@ -49,6 +49,19 @@ class StoredArticle:
 
 
 @dataclass(frozen=True)
+class CollectionOmission:
+    scope: str
+    identifier: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class CollectionResult:
+    stored: tuple[StoredArticle, ...]
+    omissions: tuple[CollectionOmission, ...]
+
+
+@dataclass(frozen=True)
 class ReadingCard:
     article_id: str
     title: str
