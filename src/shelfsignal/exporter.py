@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import errno
+import hashlib
 import os
 import re
 import secrets
@@ -9,7 +10,8 @@ import stat
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-from .content import ensure_safe_directory
+from .content import _load_metadata, ensure_safe_directory
+from .weread import _raster_kind
 
 ALLOWED_FILES = ("source.md", "metadata.md", "ocr.md")
 
@@ -17,6 +19,8 @@ _SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _SAFE_ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 _MARKDOWN_LINK = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]+)\)")
 _MARKDOWN_REFERENCE = re.compile(r"(?m)^\s{0,3}\[[^\]\n]+\]:\s*(\S+)")
+_MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
+_RAW_HTML_TAG = re.compile(r"</?[A-Za-z][^>\n]*>")
 _RASTER_SUFFIXES = {
     ".avif",
     ".bmp",
@@ -135,7 +139,7 @@ def _read_regular_at(
         raise ExportError(f"unsafe {label} file") from exc
     try:
         details = os.fstat(descriptor)
-        if not stat.S_ISREG(details.st_mode):
+        if not stat.S_ISREG(details.st_mode) or details.st_nlink != 1:
             raise ExportError(f"unsafe {label} file")
         if details.st_size > max_bytes:
             raise ExportError(f"{label} file is too large")
@@ -152,14 +156,21 @@ def _read_regular_at(
         os.close(descriptor)
 
 
-def _add_blob(plan: dict[PurePosixPath, bytes], path: PurePosixPath, content: bytes) -> None:
+def _add_blob(
+    plan: dict[PurePosixPath, bytes],
+    path: PurePosixPath,
+    content: bytes,
+    total_bytes: int,
+) -> int:
     if path in plan:
         raise ExportError(f"duplicate export path: {path}")
     if len(plan) >= _MAX_FILES:
         raise ExportError(f"too many export files; maximum is {_MAX_FILES}")
-    if sum(map(len, plan.values())) + len(content) > _MAX_EXPORT_BYTES:
+    total_bytes += len(content)
+    if total_bytes > _MAX_EXPORT_BYTES:
         raise ExportError("export exceeds the aggregate size limit")
     plan[path] = content
+    return total_bytes
 
 
 def _bounded_names(directory_fd: int, limit: int, label: str) -> list[str]:
@@ -176,33 +187,56 @@ def _collect_article(
     library_fd: int,
     article_id: str,
     plan: dict[PurePosixPath, bytes],
-) -> None:
+    total_bytes: int,
+) -> int:
     article_fd = _open_child_directory(library_fd, article_id, "article")
     try:
-        limits = {
-            "source.md": _MAX_SOURCE_BYTES,
-            "metadata.md": _MAX_METADATA_BYTES,
-            "ocr.md": _MAX_OCR_BYTES,
-        }
-        for name in ALLOWED_FILES:
-            content = _read_regular_at(
-                article_fd,
-                name,
-                label=f"article {article_id} {name}",
-                max_bytes=limits[name],
-                optional=name == "ocr.md",
-            )
+        source = _read_regular_at(
+            article_fd,
+            "source.md",
+            label=f"article {article_id} source.md",
+            max_bytes=_MAX_SOURCE_BYTES,
+        )
+        metadata = _read_regular_at(
+            article_fd,
+            "metadata.md",
+            label=f"article {article_id} metadata.md",
+            max_bytes=_MAX_METADATA_BYTES,
+        )
+        ocr = _read_regular_at(
+            article_fd,
+            "ocr.md",
+            label=f"article {article_id} ocr.md",
+            max_bytes=_MAX_OCR_BYTES,
+            optional=True,
+        )
+        assert source is not None and metadata is not None
+        try:
+            values = _load_metadata(metadata.decode("utf-8"))
+        except (UnicodeDecodeError, TypeError, ValueError) as exc:
+            raise ExportError(f"invalid article {article_id} metadata") from exc
+        if values["article_id"] != article_id:
+            raise ExportError(f"article {article_id} metadata ID mismatch")
+        if values["source_sha256"] != hashlib.sha256(source).hexdigest():
+            raise ExportError(f"article {article_id} source hash mismatch")
+
+        for name, content in (
+            ("source.md", source),
+            ("metadata.md", metadata),
+            ("ocr.md", ocr),
+        ):
             if content is not None:
-                _add_blob(
+                total_bytes = _add_blob(
                     plan,
                     PurePosixPath("articles", article_id, name),
                     content,
+                    total_bytes,
                 )
 
         try:
             assets_fd = os.open("assets", _directory_flags(), dir_fd=article_fd)
         except FileNotFoundError:
-            return
+            return total_bytes
         except OSError as exc:
             raise ExportError(f"unsafe article {article_id} assets directory") from exc
         try:
@@ -222,7 +256,8 @@ def _collect_article(
                     raise ExportError(f"hidden article {article_id} asset is not exportable")
                 if not _SAFE_ASSET_NAME.fullmatch(name):
                     raise ExportError(f"unsafe article {article_id} asset filename")
-                if Path(name).suffix.lower() not in _RASTER_SUFFIXES:
+                suffix = Path(name).suffix.lower()
+                if suffix not in {*_RASTER_SUFFIXES, ".bin"}:
                     raise ExportError(f"article {article_id} asset is not a raster file")
                 content = _read_regular_at(
                     assets_fd,
@@ -231,15 +266,26 @@ def _collect_article(
                     max_bytes=_MAX_ASSET_BYTES,
                 )
                 assert content is not None
-                _add_blob(
+                kind = _raster_kind(content)
+                expected = {
+                    ".jpg": "jpeg",
+                    ".jpeg": "jpeg",
+                    ".tif": "tiff",
+                    ".tiff": "tiff",
+                }.get(suffix, suffix.removeprefix("."))
+                if kind is None or (suffix != ".bin" and kind != expected):
+                    raise ExportError(f"article {article_id} asset raster signature mismatch")
+                total_bytes = _add_blob(
                     plan,
                     PurePosixPath("articles", article_id, "assets", name),
                     content,
+                    total_bytes,
                 )
         finally:
             os.close(assets_fd)
     finally:
         os.close(article_fd)
+    return total_bytes
 
 
 def _link_target(raw: str) -> str:
@@ -263,7 +309,15 @@ def _validate_markdown_links(plan: dict[PurePosixPath, bytes]) -> None:
             markdown = content.decode("utf-8")
         except UnicodeDecodeError as exc:
             raise ExportError(f"{markdown_path} must be UTF-8 Markdown") from exc
-        matches = [*_MARKDOWN_LINK.finditer(markdown), *_MARKDOWN_REFERENCE.finditer(markdown)]
+        autolinks = list(_MARKDOWN_AUTOLINK.finditer(markdown))
+        without_autolinks = _MARKDOWN_AUTOLINK.sub("", markdown)
+        if _RAW_HTML_TAG.search(without_autolinks):
+            raise ExportError(f"raw HTML is not allowed in {markdown_path}")
+        matches = [
+            *_MARKDOWN_LINK.finditer(markdown),
+            *_MARKDOWN_REFERENCE.finditer(markdown),
+            *autolinks,
+        ]
         for match in matches:
             target = _link_target(match.group(1))
             if not target:
@@ -302,9 +356,15 @@ def _build_plan(article_ids: tuple[str, ...], library_dir: Path) -> dict[PurePos
 
     library_fd = _open_absolute_directory(library_dir, "library")
     plan: dict[PurePosixPath, bytes] = {}
+    total_bytes = 0
     try:
         for article_id in article_ids:
-            _collect_article(library_fd, article_id, plan)
+            total_bytes = _collect_article(
+                library_fd,
+                article_id,
+                plan,
+                total_bytes,
+            )
     finally:
         os.close(library_fd)
 
@@ -313,7 +373,12 @@ def _build_plan(article_ids: tuple[str, ...], library_dir: Path) -> dict[PurePos
         f"- [{article_id}](articles/{article_id}/source.md)"
         for article_id in article_ids
     )
-    _add_blob(plan, PurePosixPath("index.md"), ("\n".join(lines) + "\n").encode())
+    _add_blob(
+        plan,
+        PurePosixPath("index.md"),
+        ("\n".join(lines) + "\n").encode(),
+        total_bytes,
+    )
     _validate_markdown_links(plan)
     return plan
 
@@ -439,7 +504,11 @@ def _read_existing_tree(
                 os.close(child)
             result.update(nested)
             continue
-        if not stat.S_ISREG(details.st_mode) or stat.S_IMODE(details.st_mode) != 0o600:
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_nlink != 1
+            or stat.S_IMODE(details.st_mode) != 0o600
+        ):
             raise ExportError("unsafe destination contains nonregular content")
         content = _read_regular_at(
             directory_fd,
