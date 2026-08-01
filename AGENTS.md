@@ -74,7 +74,7 @@ Create directories only when they have a concrete v0 use:
 ```text
 src/shelfsignal/              Python package
 skills/shelfsignal-wechat/    host-neutral global Skill
-swift/                        Apple Vision OCR helper
+src/shelfsignal/resources/   Runtime resources shipped inside the Python package
 tests/                        unit, fixture, and contract tests
 docs/superpowers/specs/       approved design specifications
 docs/superpowers/plans/       approved implementation plans
