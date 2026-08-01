@@ -51,13 +51,26 @@ def test_normalize_html_accepts_one_dimension_and_data_src_without_huge_integer_
         <img width="999999999999999999999999999999999999999999999999999999999999"
              src="https://example.invalid/huge.jpg">
         <img width="640" src="https://unapproved.example/image.jpg"
-             data-src="https://example.invalid/ignored-fallback.jpg">
+             data-src="https://example.invalid/safe-fallback.jpg">
         """
     )
     assert normalized.image_urls == (
         "https://example.invalid/width-only.jpg",
         "https://example.invalid/lazy.png",
+        "https://example.invalid/safe-fallback.jpg",
     )
+
+
+def test_normalize_html_prefers_safe_src_and_drops_two_unsafe_candidates():
+    normalized = normalize_html(
+        """
+        <img width="640" src="https://example.invalid/preferred.jpg"
+             data-src="https://mmbiz.qpic.cn/fallback.jpg">
+        <img width="640" src="data:image/gif;base64,placeholder"
+             data-src="https://unapproved.example/image.jpg">
+        """
+    )
+    assert normalized.image_urls == ("https://example.invalid/preferred.jpg",)
 
 
 @pytest.mark.parametrize(

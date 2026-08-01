@@ -128,7 +128,14 @@ class _ArticleParser(HTMLParser):
             return
 
         values = {key.lower(): value for key, value in attrs}
-        source = values.get("src") or values.get("data-src")
+        source = next(
+            (
+                candidate
+                for candidate in (values.get("src"), values.get("data-src"))
+                if candidate and _safe_https_url(candidate, image=True)
+            ),
+            None,
+        )
         width = _dimension(values.get("width") or values.get("data-w"))
         height = _dimension(values.get("height") or values.get("data-h"))
         classes = (values.get("class") or "").lower().split()
@@ -137,7 +144,6 @@ class _ArticleParser(HTMLParser):
             source
             and not is_avatar
             and max(width, height) >= 320
-            and _safe_https_url(source, image=True)
         ):
             self.images.append(source)
 
