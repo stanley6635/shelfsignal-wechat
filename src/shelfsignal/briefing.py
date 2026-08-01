@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
 import re
 import stat
 from collections import Counter
-from collections.abc import Collection
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import urlparse
@@ -16,12 +17,18 @@ from .models import ReadingCard
 
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _ID_LINE = re.compile(r"<!-- shelfsignal:id=([A-Za-z0-9][A-Za-z0-9_.:-]{0,127}) -->\Z")
+_DIGEST_LINE = re.compile(r"<!-- shelfsignal:digest=([0-9a-f]{64}) -->\Z")
 _CHECK_LINE = re.compile(r"- \[([ xX])\] \*\*Select\*\*\Z")
-_MANIFEST_ITEM = re.compile(r"- `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
+_MANIFEST_ITEM = re.compile(
+    r"- `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})` sha256:([0-9a-f]{64})\Z"
+)
 _RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\Z")
 _ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
+_RAW_HTML_TAG = re.compile(
+    r"<\s*/?\s*[A-Za-z][A-Za-z0-9-]*(?:\s+[^>]*)?\s*/?>", re.IGNORECASE
+)
 _MAX_CARDS = 2_000
 _MAX_WARNINGS = 200
 _MAX_WARNING_CHARACTERS = 1_000
@@ -70,6 +77,16 @@ def _utc_instant(value: datetime) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise BriefingError("published_at must be timezone-aware")
     return value.astimezone(UTC)
+
+
+def _canonical_digest(article_id: str, values: Mapping[str, str], evidence: str) -> str:
+    payload = [article_id]
+    payload.extend(values[label] for label, _ in _VISIBLE_FIELDS)
+    payload.append(evidence)
+    serialized = json.dumps(
+        payload, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
 
 
 def _safe_source_url(value: str) -> bool:
@@ -148,10 +165,20 @@ def create_briefing_shell(
         ocr = _bounded_text(card.ocr_status, _MAX_STATUS_CHARACTERS, "OCR status")
         excerpt = _bounded_text(card.excerpt, _MAX_EXCERPT_CHARACTERS, "excerpt")
         published = _utc_instant(card.published_at).isoformat()
+        values = {
+            "Title": title,
+            "Account": account,
+            "Published": published,
+            "Source": source_url,
+            "Retrieval": retrieval,
+            "OCR": ocr,
+        }
+        digest = _canonical_digest(card.article_id, values, excerpt)
         lines.extend(
             [
                 f"## Article · `{card.article_id}`",
                 f"<!-- shelfsignal:id={card.article_id} -->",
+                f"<!-- shelfsignal:digest={digest} -->",
                 "- [ ] **Select**",
                 f"- Title: {_markdown_string(title)}",
                 f"- Account: {_markdown_string(account)}",
@@ -177,15 +204,18 @@ def create_briefing_shell(
     return result
 
 
-def _expected_id_tuple(expected_ids: Collection[str]) -> tuple[str, ...]:
-    if isinstance(expected_ids, (str, bytes)):
-        raise BriefingError("expected IDs must be a collection")
-    values = tuple(_validate_id(item, "expected article ID") for item in expected_ids)
-    if len(values) > _MAX_CARDS:
+def _expected_bindings(expected: Mapping[str, str]) -> dict[str, str]:
+    if not isinstance(expected, Mapping):
+        raise BriefingError("expected manifest bindings must be an ID-to-digest mapping")
+    if len(expected) > _MAX_CARDS:
         raise BriefingError(f"too many expected IDs; maximum is {_MAX_CARDS}")
-    if len(values) != len(set(values)):
-        raise BriefingError("duplicate expected IDs")
-    return values
+    result: dict[str, str] = {}
+    for article_id, digest in expected.items():
+        article_id = _validate_id(article_id, "expected article ID")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            raise BriefingError(f"invalid expected digest for {article_id}")
+        result[article_id] = digest
+    return result
 
 
 _VISIBLE_FIELDS = (
@@ -199,6 +229,7 @@ _VISIBLE_FIELDS = (
 _ARTICLE_CONTROL_PREFIXES = (
     "## Article",
     "<!-- shelfsignal:id=",
+    "<!-- shelfsignal:digest=",
     "> Evidence",
     *tuple(f"- {label}" for label, _ in _VISIBLE_FIELDS),
 )
@@ -236,7 +267,11 @@ def _reject_wrapped_controls(lines: list[str]) -> None:
             fence = (marker[0], len(marker))
             continue
 
-        if "<!--" in line and _ID_LINE.fullmatch(line) is None:
+        if (
+            "<!--" in line
+            and _ID_LINE.fullmatch(line) is None
+            and _DIGEST_LINE.fullmatch(line) is None
+        ):
             if _looks_like_article_control(line):
                 raise BriefingError("article control is inside an outer HTML comment")
             after_open = line.split("<!--", 1)[1]
@@ -247,6 +282,20 @@ def _reject_wrapped_controls(lines: list[str]) -> None:
         raise BriefingError("unterminated fenced code block")
     if in_comment:
         raise BriefingError("unterminated outer HTML comment")
+
+
+def _reject_raw_html(lines: list[str]) -> None:
+    for line in lines:
+        if _ID_LINE.fullmatch(line) or _DIGEST_LINE.fullmatch(line):
+            continue
+        if (
+            "<!--" in line
+            or "-->" in line
+            or "<!DOCTYPE" in line.upper()
+            or "<?" in line
+            or _RAW_HTML_TAG.search(line)
+        ):
+            raise BriefingError("raw HTML is not allowed in a briefing")
 
 
 def _parse_json_field(line: str, label: str, limit: int) -> str:
@@ -275,7 +324,7 @@ def _parse_evidence(line: str) -> str:
     return value
 
 
-def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
+def _id_checks(markdown: str) -> tuple[tuple[str, str, str], ...]:
     if not isinstance(markdown, str):
         raise BriefingError("briefing must be text")
     if len(markdown.encode("utf-8")) > _MAX_BRIEFING_BYTES:
@@ -286,9 +335,10 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
         raise BriefingError("invalid briefing run header")
     if sum(line.startswith("# WeChat briefing ·") for line in lines) != 1:
         raise BriefingError("duplicate briefing run header")
+    _reject_raw_html(lines)
     _reject_wrapped_controls(lines)
 
-    pairs: list[tuple[str, str]] = []
+    pairs: list[tuple[str, str, str]] = []
     canonical_indices: set[int] = set()
     for index, line in enumerate(lines):
         if not line.startswith("## Article"):
@@ -296,19 +346,22 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
         header = _ARTICLE_HEADER.fullmatch(line)
         if header is None:
             raise BriefingError("malformed article section header")
-        if index + 12 >= len(lines):
+        if index + 13 >= len(lines):
             raise BriefingError("incomplete canonical article section")
         hidden = _ID_LINE.fullmatch(lines[index + 1])
         if hidden is None:
             raise BriefingError("article header is not followed by a hidden ID")
         if header.group(1) != hidden.group(1):
             raise BriefingError("article header and hidden ID differ")
-        check = _CHECK_LINE.fullmatch(lines[index + 2])
+        digest_match = _DIGEST_LINE.fullmatch(lines[index + 2])
+        if digest_match is None:
+            raise BriefingError("article ID is not followed by a canonical digest")
+        check = _CHECK_LINE.fullmatch(lines[index + 3])
         if check is None:
-            raise BriefingError("article ID and checkbox must be adjacent")
+            raise BriefingError("article digest and checkbox must be adjacent")
 
         values: dict[str, str] = {}
-        for offset, (label, limit) in enumerate(_VISIBLE_FIELDS, start=3):
+        for offset, (label, limit) in enumerate(_VISIBLE_FIELDS, start=4):
             values[label] = _parse_json_field(lines[index + offset], label, limit)
         try:
             published = datetime.fromisoformat(values["Published"])
@@ -317,21 +370,24 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
         _utc_instant(published)
         if not _safe_source_url(values["Source"]):
             raise BriefingError("malformed Source field: expected safe HTTPS URL")
-        if lines[index + 9] != "":
+        if lines[index + 10] != "":
             raise BriefingError("missing separator before Evidence field")
-        _parse_evidence(lines[index + 10])
-        if lines[index + 11] != "" or lines[index + 12] != "### Agent ranking":
+        evidence = _parse_evidence(lines[index + 11])
+        recomputed = _canonical_digest(hidden.group(1), values, evidence)
+        if digest_match.group(1) != recomputed:
+            raise BriefingError(f"canonical payload digest mismatch: {hidden.group(1)}")
+        if lines[index + 12] != "" or lines[index + 13] != "### Agent ranking":
             raise BriefingError("missing canonical Agent ranking section")
 
-        canonical_indices.update(range(index, index + 11))
-        pairs.append((hidden.group(1), check.group(1)))
+        canonical_indices.update(range(index, index + 12))
+        pairs.append((hidden.group(1), check.group(1), digest_match.group(1)))
         if len(pairs) > _MAX_CARDS:
             raise BriefingError(f"too many article controls; maximum is {_MAX_CARDS}")
 
     for index, line in enumerate(lines):
         if index in canonical_indices:
             continue
-        if _CHECK_LINE.fullmatch(line) or _ID_LINE.fullmatch(line):
+        if _CHECK_LINE.fullmatch(line) or _ID_LINE.fullmatch(line) or _DIGEST_LINE.fullmatch(line):
             raise BriefingError("article control is not attached to a canonical article")
         if _looks_like_article_control(line):
             raise BriefingError("decoy or duplicate article field/control")
@@ -340,12 +396,12 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
 
 def validate_briefing(
     markdown: str,
-    expected_ids: Collection[str],
+    expected_bindings: Mapping[str, str],
     require_unchecked: bool,
 ) -> tuple[str, ...]:
-    expected = _expected_id_tuple(expected_ids)
+    expected = _expected_bindings(expected_bindings)
     pairs = _id_checks(markdown)
-    ids = [article_id for article_id, _ in pairs]
+    ids = [article_id for article_id, _, _ in pairs]
     duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
     missing = sorted(set(expected) - set(ids))
     invented = sorted(set(ids) - set(expected))
@@ -355,27 +411,52 @@ def validate_briefing(
         raise BriefingError(f"invented IDs: {invented}")
     if missing:
         raise BriefingError(f"missing IDs: {missing}")
-    if require_unchecked and any(mark.lower() == "x" for _, mark in pairs):
+    mismatched = sorted(
+        article_id
+        for article_id, _, digest in pairs
+        if expected.get(article_id) != digest
+    )
+    if mismatched:
+        raise BriefingError(f"manifest digest mismatch: {mismatched}")
+    if require_unchecked and any(mark.lower() == "x" for _, mark, _ in pairs):
         raise BriefingError("initial briefing contains a checked item")
     return tuple(ids)
 
 
-def selected_ids(markdown: str, expected_ids: Collection[str]) -> tuple[str, ...]:
+def selected_ids(markdown: str, expected_bindings: Mapping[str, str]) -> tuple[str, ...]:
     """Return checked IDs only after validating against manifest-derived IDs."""
-    validate_briefing(markdown, expected_ids, require_unchecked=False)
+    validate_briefing(markdown, expected_bindings, require_unchecked=False)
     return tuple(
         article_id
-        for article_id, mark in _id_checks(markdown)
+        for article_id, mark, _ in _id_checks(markdown)
         if mark.lower() == "x"
     )
-def write_run_manifest(article_ids: tuple[str, ...], path: Path) -> Path:
-    if len(article_ids) > _MAX_MANIFEST_IDS:
+
+
+def initial_run_bindings(markdown: str) -> dict[str, str]:
+    """Extract bindings from the pristine shell before any host-agent editing.
+
+    Task 13 integration contract: call this immediately after
+    ``create_briefing_shell``, persist the result with ``write_run_manifest``,
+    and later pass only ``read_run_manifest`` output to ``validate_briefing``
+    and ``selected_ids``. Never regenerate bindings from an edited briefing.
+    """
+    pairs = _id_checks(markdown)
+    ids = [article_id for article_id, _, _ in pairs]
+    duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
+    if duplicates:
+        raise BriefingError(f"duplicate IDs: {duplicates}")
+    return {article_id: digest for article_id, _, digest in pairs}
+
+
+def write_run_manifest(bindings: Mapping[str, str], path: Path) -> Path:
+    values = _expected_bindings(bindings)
+    if len(values) > _MAX_MANIFEST_IDS:
         raise BriefingError(f"too many manifest IDs; maximum is {_MAX_MANIFEST_IDS}")
-    values = tuple(_validate_id(item, "article ID") for item in article_ids)
-    if len(values) != len(set(values)):
-        raise BriefingError("duplicate manifest IDs")
     lines = [_MANIFEST_HEADER, ""]
-    lines.extend(f"- `{article_id}`" for article_id in sorted(values))
+    lines.extend(
+        f"- `{article_id}` sha256:{values[article_id]}" for article_id in sorted(values)
+    )
     content = ("\n".join(lines) + "\n").encode("utf-8")
     if len(content) > _MAX_MANIFEST_BYTES:
         raise BriefingError("run manifest is too large")
@@ -445,9 +526,7 @@ def _read_manifest_bytes(path: Path) -> bytes:
         os.close(parent_fd)
 
 
-def read_run_manifest(
-    path: Path, expected_ids: Collection[str] | None = None
-) -> tuple[str, ...]:
+def read_run_manifest(path: Path) -> dict[str, str]:
     try:
         text = _read_manifest_bytes(path).decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -458,24 +537,21 @@ def read_run_manifest(
     lines = text[:-1].split("\n")
     if len(lines) < 2 or lines[:2] != [_MANIFEST_HEADER, ""]:
         raise BriefingError("invalid run manifest header")
+    bindings: dict[str, str] = {}
     ids: list[str] = []
     for line in lines[2:]:
         match = _MANIFEST_ITEM.fullmatch(line)
         if match is None:
             raise BriefingError("invalid run manifest content")
-        ids.append(match.group(1))
+        article_id, digest = match.groups()
+        ids.append(article_id)
+        if article_id in bindings:
+            raise BriefingError("duplicate manifest IDs")
+        bindings[article_id] = digest
     if len(ids) > _MAX_MANIFEST_IDS:
         raise BriefingError(f"too many manifest IDs; maximum is {_MAX_MANIFEST_IDS}")
     if len(ids) != len(set(ids)):
         raise BriefingError("duplicate manifest IDs")
     if ids != sorted(ids):
         raise BriefingError("run manifest IDs are not sorted")
-    if expected_ids is not None:
-        expected = _expected_id_tuple(expected_ids)
-        missing = sorted(set(expected) - set(ids))
-        invented = sorted(set(ids) - set(expected))
-        if invented:
-            raise BriefingError(f"invented IDs: {invented}")
-        if missing:
-            raise BriefingError(f"missing IDs: {missing}")
-    return tuple(ids)
+    return bindings

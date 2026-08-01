@@ -11,6 +11,7 @@ import shelfsignal.briefing as briefing_module
 from shelfsignal.briefing import (
     BriefingError,
     create_briefing_shell,
+    initial_run_bindings,
     read_run_manifest,
     selected_ids,
     validate_briefing,
@@ -35,6 +36,10 @@ def card(article_id: str, **changes: object) -> ReadingCard:
     return replace(value, **changes)
 
 
+def bindings(markdown: str) -> dict[str, str]:
+    return initial_run_bindings(markdown)
+
+
 def test_shell_contains_every_candidate_once_unchecked_and_in_input_order():
     markdown = create_briefing_shell("run-001", (card("a-2"), card("a-1")))
 
@@ -42,10 +47,11 @@ def test_shell_contains_every_candidate_once_unchecked_and_in_input_order():
     assert "- [x]" not in markdown.lower()
     assert markdown.count("<!-- shelfsignal:id=a-1 -->") == 1
     assert markdown.count("<!-- shelfsignal:id=a-2 -->") == 1
+    assert markdown.count("<!-- shelfsignal:digest=") == 2
     assert markdown.count("## Article · `a-1`") == 1
     assert markdown.count("## Article · `a-2`") == 1
     assert markdown.index("shelfsignal:id=a-2") < markdown.index("shelfsignal:id=a-1")
-    assert validate_briefing(markdown, {"a-1", "a-2"}, True) == ("a-2", "a-1")
+    assert validate_briefing(markdown, bindings(markdown), True) == ("a-2", "a-1")
 
 
 def test_shell_rejects_bad_run_card_and_warning_inputs():
@@ -84,7 +90,7 @@ def test_shell_bounds_and_escapes_untrusted_markdown_fields():
     assert "\r" not in markdown
     assert "\n<!-- shelfsignal:id=invented -->\n" not in markdown
     assert len(markdown.encode()) < 100_000
-    assert validate_briefing(markdown, {"a-1"}, True) == ("a-1",)
+    assert validate_briefing(markdown, bindings(markdown), True) == ("a-1",)
 
 
 def test_shell_enforces_card_count_and_artifact_budget(monkeypatch: pytest.MonkeyPatch):
@@ -111,7 +117,7 @@ def test_host_ranking_edit_preserves_integrity():
         "- Confidence: High",
     )
 
-    assert validate_briefing(ranked, {"a-1", "a-2"}, True) == ("a-1", "a-2")
+    assert validate_briefing(ranked, bindings(markdown), True) == ("a-1", "a-2")
 
 
 @pytest.mark.parametrize(
@@ -122,21 +128,18 @@ def test_host_ranking_edit_preserves_integrity():
             lambda text: text.replace("## Article · `a-2`", "## Article · `invented`").replace(
                 "<!-- shelfsignal:id=a-2 -->", "<!-- shelfsignal:id=invented -->"
             ),
-            "invented IDs",
+            "digest mismatch",
         ),
         (
             lambda text: text.replace("## Article · `a-2`", "## Article · `a-1`").replace(
                 "<!-- shelfsignal:id=a-2 -->", "<!-- shelfsignal:id=a-1 -->"
             ),
-            "duplicate IDs",
+            "digest mismatch",
         ),
         (lambda text: text.replace("- [ ] **Select**", "- Select", 1), "checkbox"),
         (lambda text: text.replace("- [ ] **Select**", "- [x] **Select**", 1), "checked"),
         (
-            lambda text: text.replace(
-                "<!-- shelfsignal:id=a-1 -->\n- [ ] **Select**",
-                "<!-- shelfsignal:id=a-1 -->\ninterposed\n- [ ] **Select**",
-            ),
+            lambda text: text.replace("- [ ] **Select**", "interposed\n- [ ] **Select**", 1),
             "adjacent",
         ),
         (
@@ -148,7 +151,7 @@ def test_host_ranking_edit_preserves_integrity():
 def test_validator_rejects_integrity_breaks(mutate, message):
     markdown = create_briefing_shell("run-001", (card("a-1"), card("a-2")))
     with pytest.raises(BriefingError, match=message):
-        validate_briefing(mutate(markdown), {"a-1", "a-2"}, True)
+        validate_briefing(mutate(markdown), bindings(markdown), True)
 
 
 @pytest.mark.parametrize(
@@ -157,28 +160,32 @@ def test_validator_rejects_integrity_breaks(mutate, message):
 )
 def test_validator_rejects_deleted_or_duplicate_visible_field(field: str):
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
+    expected = bindings(markdown)
     line = next(item for item in markdown.splitlines() if item.startswith(f"- {field}: "))
 
     with pytest.raises(BriefingError, match=f"{field} field"):
-        validate_briefing(markdown.replace(f"{line}\n", "", 1), {"a-1"}, True)
+        validate_briefing(markdown.replace(f"{line}\n", "", 1), expected, True)
     with pytest.raises(BriefingError, match="decoy or duplicate article field"):
-        validate_briefing(markdown + f"{line}\n", {"a-1"}, True)
+        validate_briefing(markdown + f"{line}\n", expected, True)
 
 
 def test_validator_rejects_deleted_or_duplicate_evidence():
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
     evidence = next(item for item in markdown.splitlines() if item.startswith("> Evidence: "))
     with pytest.raises(BriefingError, match="Evidence field"):
-        validate_briefing(markdown.replace(f"{evidence}\n", "", 1), {"a-1"}, True)
+        validate_briefing(markdown.replace(f"{evidence}\n", "", 1), expected, True)
     with pytest.raises(BriefingError, match="decoy or duplicate article field"):
-        validate_briefing(markdown + f"{evidence}\n", {"a-1"}, True)
+        validate_briefing(markdown + f"{evidence}\n", expected, True)
 
 
 def test_validator_rejects_header_hidden_id_mismatch():
     markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    expected = bindings(markdown)
     mismatched = markdown.replace("## Article · `a-2`", "## Article · `a-1`", 1)
     with pytest.raises(BriefingError, match="header and hidden ID differ"):
-        validate_briefing(mismatched, {"a-1", "a-2"}, True)
+        validate_briefing(mismatched, expected, True)
 
 
 @pytest.mark.parametrize(
@@ -192,16 +199,17 @@ def test_validator_rejects_header_hidden_id_mismatch():
 )
 def test_validator_rejects_missing_or_malformed_source(replacement: str):
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
     original = next(
         item for item in markdown.splitlines() if item.startswith("- Source: ")
     )
     with pytest.raises(BriefingError, match="Source field"):
-        validate_briefing(markdown.replace(original, replacement), {"a-1"}, True)
+        validate_briefing(markdown.replace(original, replacement), expected, True)
     with pytest.raises(BriefingError, match="Source field"):
-        validate_briefing(markdown.replace(f"{original}\n", "", 1), {"a-1"}, True)
+        validate_briefing(markdown.replace(f"{original}\n", "", 1), expected, True)
 
     with pytest.raises(BriefingError, match="decoy or duplicate article field"):
-        validate_briefing(markdown + "- Source : https://example.invalid/decoy\n", {"a-1"}, True)
+        validate_briefing(markdown + "- Source : https://example.invalid/decoy\n", expected, True)
 
 
 @pytest.mark.parametrize(
@@ -217,26 +225,99 @@ def test_validator_rejects_article_controls_wrapped_in_fence_or_comment(
     opening: str, closing: str
 ):
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
     lines = markdown.splitlines()
     start = lines.index("## Article · `a-1`")
     wrapped = lines[:start] + [opening] + lines[start:] + [closing]
     tampered = "\n".join(wrapped) + "\n"
 
-    with pytest.raises(BriefingError, match="fenced code|HTML comment"):
-        validate_briefing(tampered, {"a-1"}, True)
+    with pytest.raises(BriefingError, match="fenced code|HTML comment|raw HTML"):
+        validate_briefing(tampered, expected, True)
     checked = tampered.replace("- [ ] **Select**", "- [x] **Select**", 1)
-    with pytest.raises(BriefingError, match="fenced code|HTML comment"):
-        selected_ids(checked, {"a-1"})
+    with pytest.raises(BriefingError, match="fenced code|HTML comment|raw HTML"):
+        selected_ids(checked, expected)
 
 
 def test_validator_rejects_checked_decoy_in_fence_or_multiline_comment():
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
     for decoy in (
         "\n```\n## Article · `decoy`\n<!-- shelfsignal:id=decoy -->\n- [x] **Select**\n```\n",
         "\n<!-- outer\n## Article · `decoy`\n<!-- shelfsignal:id=decoy -->\n- [x] **Select**\n-->\n",
     ):
-        with pytest.raises(BriefingError, match="fenced code|HTML comment"):
-            selected_ids(markdown + decoy, {"a-1"})
+        with pytest.raises(BriefingError, match="fenced code|HTML comment|raw HTML"):
+            selected_ids(markdown + decoy, expected)
+
+
+@pytest.mark.parametrize(
+    "raw_html",
+    [
+        "<div hidden>",
+        "</div>",
+        "<div hidden>same line</div>",
+        "<script>alert(1)</script>",
+        "<style>body{display:none}</style>",
+        "<details open>",
+        "<table><tr><td>hidden</td></tr></table>",
+    ],
+)
+def test_validator_rejects_raw_html_anywhere(raw_html: str):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
+    tampered = markdown.replace("## Article", f"{raw_html}\n## Article", 1)
+
+    with pytest.raises(BriefingError, match="raw HTML"):
+        validate_briefing(tampered, expected, True)
+    with pytest.raises(BriefingError, match="raw HTML"):
+        selected_ids(tampered.replace("- [ ] **Select**", "- [x] **Select**"), expected)
+
+
+def test_manifest_digest_binds_visible_payload_and_id_markers():
+    markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    expected = bindings(markdown)
+
+    altered = markdown.replace('"Title a-1"', '"Altered title"', 1)
+    with pytest.raises(BriefingError, match="digest mismatch"):
+        validate_briefing(altered, expected, True)
+
+    swapped_ids = (
+        markdown.replace("`a-1`", "`temporary`", 1)
+        .replace("`a-2`", "`a-1`", 1)
+        .replace("`temporary`", "`a-2`", 1)
+        .replace("shelfsignal:id=a-1", "shelfsignal:id=temporary", 1)
+        .replace("shelfsignal:id=a-2", "shelfsignal:id=a-1", 1)
+        .replace("shelfsignal:id=temporary", "shelfsignal:id=a-2", 1)
+    )
+    with pytest.raises(BriefingError, match="digest mismatch"):
+        validate_briefing(swapped_ids, expected, True)
+
+    digest_lines = [
+        line for line in markdown.splitlines() if line.startswith("<!-- shelfsignal:digest=")
+    ]
+    swapped_digests = (
+        markdown.replace(digest_lines[0], "DIGEST-TEMP", 1)
+        .replace(digest_lines[1], digest_lines[0], 1)
+        .replace("DIGEST-TEMP", digest_lines[1], 1)
+    )
+    with pytest.raises(BriefingError, match="digest mismatch"):
+        validate_briefing(swapped_digests, expected, True)
+
+
+def test_block_reordering_checkbox_and_ranking_edits_preserve_bindings():
+    markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    expected = bindings(markdown)
+    first = markdown.index("## Article · `a-1`")
+    second = markdown.index("## Article · `a-2`")
+    reordered = markdown[:first] + markdown[second:] + markdown[first:second]
+    edited = (
+        reordered.replace("- [ ] **Select**", "- [x] **Select**", 1)
+        .replace("- Summary: Awaiting host-agent ranking", "- Summary: Ranked", 1)
+        .replace("- Reason: Awaiting host-agent ranking", "- Reason: Relevant", 1)
+        .replace("- Confidence: Awaiting host-agent ranking", "- Confidence: High", 1)
+    )
+
+    assert validate_briefing(edited, expected, False) == ("a-2", "a-1")
+    assert selected_ids(edited, expected) == ("a-2",)
 
 
 def test_renderer_rejects_unsafe_source_url():
@@ -257,16 +338,17 @@ def test_renderer_rejects_unsafe_source_url():
 def test_selected_ids_contract_requires_manifest_expected_ids(tmp_path: Path):
     markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
     checked = markdown.replace("- [ ] **Select**", "- [x] **Select**", 1)
-    manifest = write_run_manifest(("a-1", "a-2"), tmp_path / "manifest.md")
+    manifest = write_run_manifest(bindings(markdown), tmp_path / "manifest.md")
     expected = read_run_manifest(manifest)
 
     assert selected_ids(checked, expected) == ("a-1",)
 
 
-def test_validator_rejects_duplicate_expected_ids_and_decoy_controls():
+def test_validator_requires_manifest_bindings_and_rejects_decoy_controls():
     markdown = create_briefing_shell("run-1", (card("a-1"),))
-    with pytest.raises(BriefingError, match="duplicate expected IDs"):
-        validate_briefing(markdown, ("a-1", "a-1"), True)
+    expected = bindings(markdown)
+    with pytest.raises(BriefingError, match="ID-to-digest mapping"):
+        validate_briefing(markdown, ("a-1",), True)  # type: ignore[arg-type]
 
     for decoy in (
         "\n<!-- shelfsignal:id=decoy -->\n",
@@ -274,56 +356,63 @@ def test_validator_rejects_duplicate_expected_ids_and_decoy_controls():
         "\n## Article\n",
     ):
         with pytest.raises(BriefingError):
-            validate_briefing(markdown + decoy, {"a-1"}, True)
+            validate_briefing(markdown + decoy, expected, True)
 
 
 def test_validator_rejects_invalid_or_duplicate_run_header():
     markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
     with pytest.raises(BriefingError, match="run header"):
-        validate_briefing(markdown.replace("run-1", "../run", 1), {"a-1"}, True)
+        validate_briefing(markdown.replace("run-1", "../run", 1), expected, True)
     with pytest.raises(BriefingError, match="duplicate briefing run header"):
         validate_briefing(
-            markdown + "# WeChat briefing · decoy\n", {"a-1"}, True
+            markdown + "# WeChat briefing · decoy\n", expected, True
         )
 
 
-def test_selected_ids_requires_expected_set_and_rejects_tampering():
+def test_selected_ids_requires_manifest_bindings_and_rejects_tampering():
     markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    expected = bindings(markdown)
     checked = markdown.replace("- [ ] **Select**", "- [x] **Select**", 1)
-    assert selected_ids(checked, {"a-1", "a-2"}) == ("a-1",)
+    assert selected_ids(checked, expected) == ("a-1",)
 
     invented = checked.replace("`a-2`", "`invented`", 1).replace(
         "shelfsignal:id=a-2", "shelfsignal:id=invented"
     )
-    with pytest.raises(BriefingError, match="invented IDs"):
-        selected_ids(invented, {"a-1", "a-2"})
+    with pytest.raises(BriefingError, match="digest mismatch"):
+        selected_ids(invented, expected)
     duplicate = checked.replace("`a-2`", "`a-1`", 1).replace(
         "shelfsignal:id=a-2", "shelfsignal:id=a-1"
     )
-    with pytest.raises(BriefingError, match="duplicate IDs"):
-        selected_ids(duplicate, {"a-1", "a-2"})
+    with pytest.raises(BriefingError, match="digest mismatch"):
+        selected_ids(duplicate, expected)
     unattached = checked + "\n- [x] **Select**\n"
     with pytest.raises(BriefingError, match="not attached"):
-        selected_ids(unattached, {"a-1", "a-2"})
+        selected_ids(unattached, expected)
 
 
 def test_run_manifest_round_trip_is_sorted_and_private(tmp_path: Path):
-    path = write_run_manifest(("a-2", "a-1"), tmp_path / "manifest.md")
+    source = create_briefing_shell("run-1", (card("a-2"), card("a-1")))
+    expected = bindings(source)
+    path = write_run_manifest(expected, tmp_path / "manifest.md")
 
-    assert read_run_manifest(path) == ("a-1", "a-2")
-    assert read_run_manifest(path, {"a-1", "a-2"}) == ("a-1", "a-2")
+    assert read_run_manifest(path) == {
+        "a-1": expected["a-1"],
+        "a-2": expected["a-2"],
+    }
     assert path.stat().st_mode & 0o777 == 0o600
-    empty = write_run_manifest((), tmp_path / "empty.md")
-    assert read_run_manifest(empty) == ()
+    empty = write_run_manifest({}, tmp_path / "empty.md")
+    assert read_run_manifest(empty) == {}
 
 
 @pytest.mark.parametrize(
     "content",
     [
-        "# ShelfSignal run manifest\n\n- `a-1`\n- `a-1`\n",
-        "# ShelfSignal run manifest\n\n- `../a`\n",
-        "# ShelfSignal run manifest\n\n- `a-1`\nextra\n",
-        "# Wrong header\n\n- `a-1`\n",
+        "# ShelfSignal run manifest\n\n- `a-1` sha256:" + "0" * 64 + "\n- `a-1` sha256:" + "1" * 64 + "\n",
+        "# ShelfSignal run manifest\n\n- `../a` sha256:" + "0" * 64 + "\n",
+        "# ShelfSignal run manifest\n\n- `a-1` sha256:bad\n",
+        "# ShelfSignal run manifest\n\n- `a-1` sha256:" + "0" * 64 + "\nextra\n",
+        "# Wrong header\n\n- `a-1` sha256:" + "0" * 64 + "\n",
     ],
 )
 def test_run_manifest_rejects_duplicate_unsafe_or_invented_content(
@@ -335,23 +424,25 @@ def test_run_manifest_rejects_duplicate_unsafe_or_invented_content(
         read_run_manifest(path)
 
 
-def test_run_manifest_supports_crlf_but_rejects_expected_id_mismatch(tmp_path: Path):
+def test_run_manifest_supports_crlf(tmp_path: Path):
     path = tmp_path / "manifest.md"
-    path.write_bytes(b"# ShelfSignal run manifest\r\n\r\n- `a-1`\r\n")
+    digest = "0" * 64
+    path.write_bytes(
+        f"# ShelfSignal run manifest\r\n\r\n- `a-1` sha256:{digest}\r\n".encode()
+    )
 
-    assert read_run_manifest(path) == ("a-1",)
-    with pytest.raises(BriefingError, match="invented IDs"):
-        read_run_manifest(path, {"a-2"})
+    assert read_run_manifest(path) == {"a-1": digest}
 
 
 def test_run_manifest_rejects_bad_ids_duplicates_and_too_many(tmp_path: Path):
-    with pytest.raises(BriefingError, match="duplicate manifest IDs"):
-        write_run_manifest(("a-1", "a-1"), tmp_path / "manifest.md")
-    with pytest.raises(BriefingError, match="article ID"):
-        write_run_manifest(("../a",), tmp_path / "manifest.md")
-    with pytest.raises(BriefingError, match="too many manifest IDs"):
+    digest = "0" * 64
+    with pytest.raises(BriefingError, match="expected article ID"):
+        write_run_manifest({"../a": digest}, tmp_path / "manifest.md")
+    with pytest.raises(BriefingError, match="expected digest"):
+        write_run_manifest({"a-1": "bad"}, tmp_path / "manifest.md")
+    with pytest.raises(BriefingError, match="too many expected IDs"):
         write_run_manifest(
-            tuple(f"a-{index}" for index in range(2001)), tmp_path / "manifest.md"
+            {f"a-{index}": digest for index in range(2001)}, tmp_path / "manifest.md"
         )
 
 
@@ -365,7 +456,7 @@ def test_run_manifest_rejects_symlink_nonregular_and_oversize(
     with pytest.raises((BriefingError, ValueError)):
         read_run_manifest(link)
     with pytest.raises(ValueError):
-        write_run_manifest(("a-1",), link)
+        write_run_manifest({"a-1": "0" * 64}, link)
     assert outside.read_text(encoding="utf-8") == "keep"
 
     fifo = tmp_path / "manifest.fifo"
@@ -387,4 +478,4 @@ def test_write_manifest_rejects_unsafe_parent_chain(tmp_path: Path):
     link.symlink_to(real, target_is_directory=True)
 
     with pytest.raises(ValueError, match="unsafe atomic write"):
-        write_run_manifest(("a-1",), link / "manifest.md")
+        write_run_manifest({"a-1": "0" * 64}, link / "manifest.md")
