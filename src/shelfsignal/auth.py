@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from enum import StrEnum
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, async_playwright
 from playwright.async_api import Error as PlaywrightError
@@ -26,14 +27,16 @@ class AuthPolicy(StrEnum):
     REUSE = "reuse"
 
 
-def prepare_profile(browser_root: Path, run_id: str, policy: AuthPolicy) -> Path:
+def prepare_profile(browser_root: Path, run_id: str, policy: AuthPolicy | str) -> Path:
+    try:
+        policy = AuthPolicy(policy)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"unsupported authentication policy: {policy}") from exc
     if _SAFE_RUN_ID.fullmatch(run_id) is None:
         raise ValueError("run ID must be a safe single path component")
-    if policy not in (AuthPolicy.FRESH, AuthPolicy.REUSE):
-        raise ValueError(f"unsupported authentication policy: {policy}")
 
-    browser_root = browser_root.expanduser()
-    names = ("runs", run_id) if policy is AuthPolicy.FRESH else ("persistent",)
+    browser_root = _safe_absolute_browser_root(browser_root)
+    names = ("runs", run_id) if policy == AuthPolicy.FRESH else ("persistent",)
     profile = browser_root.joinpath(*names)
     if profile == browser_root or browser_root not in profile.parents:
         raise ValueError("browser profile escapes the browser root")
@@ -54,6 +57,21 @@ def prepare_profile(browser_root: Path, run_id: str, policy: AuthPolicy) -> Path
         for descriptor in reversed(descriptors):
             os.close(descriptor)
     return profile
+
+
+def _safe_absolute_browser_root(path: Path) -> Path:
+    try:
+        expanded = path.expanduser()
+    except RuntimeError as exc:
+        raise ValueError("browser root must be an unambiguous absolute path") from exc
+    if not expanded.is_absolute():
+        raise ValueError("browser root must be an absolute path")
+    if ".." in expanded.parts:
+        raise ValueError("browser root contains ambiguous parent traversal")
+    normalized = Path(os.path.normpath(os.fspath(expanded)))
+    if normalized != expanded or normalized == Path(normalized.anchor):
+        raise ValueError("browser root must be an unambiguous absolute path")
+    return normalized
 
 
 def _open_private_root(path: Path) -> int:
@@ -127,7 +145,22 @@ def _verify_root_identity(path: Path, descriptor: int) -> None:
 
 
 def is_auth_required(url: str, status: int) -> bool:
-    return "/login" in url or status in {401, 403}
+    path = _trusted_probe_path(url)
+    if status >= 400 and status not in {401, 403}:
+        classify_shelf_probe(status)
+    return path == "/web/login" or status in {401, 403}
+
+
+def _trusted_probe_path(url: str) -> str:
+    parsed = urlsplit(url)
+    path = parsed.path.rstrip("/")
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "weread.qq.com"
+        or path not in {"/web/login", "/web/shelf"}
+    ):
+        raise ShelfUnavailable("WeRead shelf returned an unexpected URL origin or path")
+    return path
 
 
 def classify_shelf_probe(status: int) -> None:
@@ -157,13 +190,14 @@ async def authenticated_context(
             user_data_dir=profile,
             headless=False,
         )
+        primary_error: BaseException | None = None
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             url, status = await _probe_shelf(page)
             if is_auth_required(url, status):
                 try:
                     async with asyncio.timeout(AUTHORIZATION_TIMEOUT_MS / 1_000):
-                        if "/login" in url:
+                        if _trusted_probe_path(url) == "/web/login":
                             try:
                                 await page.wait_for_url(
                                     "**/web/shelf**",
@@ -182,5 +216,20 @@ async def authenticated_context(
                     raise AuthRequired("WeRead QR authorization timed out") from exc
             classify_shelf_probe(status)
             yield context
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            await context.close()
+            try:
+                await context.close()
+            except BaseException as close_exc:
+                if primary_error is not None:
+                    primary_error.add_note(
+                        f"WeRead browser context also failed to close: {close_exc}"
+                    )
+                elif isinstance(close_exc, Exception):
+                    raise ShelfUnavailable(
+                        "WeRead browser context could not be closed"
+                    ) from close_exc
+                else:
+                    raise

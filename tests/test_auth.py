@@ -65,6 +65,25 @@ def test_reuse_policy_uses_persistent_profile(tmp_path: Path):
     assert path.is_dir()
 
 
+def test_string_fresh_policy_is_normalized_before_routing(tmp_path: Path):
+    path = prepare_profile(tmp_path / "browser", "run-001", "fresh")
+
+    assert path == tmp_path / "browser" / "runs" / "run-001"
+
+
+def test_prepare_profile_rejects_relative_or_parent_ambiguous_browser_root(
+    tmp_path: Path,
+):
+    base = tmp_path / "base"
+
+    with pytest.raises(ValueError, match="absolute"):
+        prepare_profile(Path("relative-browser"), "run-001", AuthPolicy.FRESH)
+    with pytest.raises(ValueError, match="ambiguous"):
+        prepare_profile(base / "child" / "..", "run-001", AuthPolicy.FRESH)
+
+    assert not base.exists()
+
+
 @pytest.mark.parametrize("run_id", ["../escape", "/tmp/escape", "nested/run", ".", "run 001"])
 def test_prepare_profile_rejects_unsafe_run_id(tmp_path: Path, run_id: str):
     with pytest.raises(ValueError, match="run ID"):
@@ -124,11 +143,29 @@ def test_login_redirect_or_auth_status_is_auth_required():
     assert is_auth_required("https://weread.qq.com/web/shelf", 401)
     assert is_auth_required("https://weread.qq.com/web/shelf", 403)
     assert not is_auth_required("https://weread.qq.com/web/shelf", 200)
+    assert not is_auth_required("https://weread.qq.com/web/shelf/?tab=saved", 200)
+    assert is_auth_required("https://weread.qq.com/web/login/?next=shelf", 200)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://evil.example/web/shelf",
+        "http://weread.qq.com/web/shelf",
+        "https://weread.qq.com.evil.example/web/shelf",
+        "https://weread.qq.com/web/other",
+    ],
+)
+def test_probe_classification_rejects_untrusted_origin_or_wrong_path(url: str):
+    with pytest.raises(ShelfUnavailable, match="unexpected URL"):
+        is_auth_required(url, 200)
 
 
 def test_server_failure_is_shelf_unavailable():
     with pytest.raises(ShelfUnavailable, match="HTTP 503"):
         classify_shelf_probe(503)
+    with pytest.raises(ShelfUnavailable, match="HTTP 503"):
+        is_auth_required("https://weread.qq.com/web/login", 503)
 
     classify_shelf_probe(200)
 
@@ -270,3 +307,89 @@ async def test_authenticated_context_rejects_unreadable_shelf_response(
             pass
 
     context.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "url", ["https://evil.example/web/shelf", "https://weread.qq.com/web/other"]
+)
+async def test_authenticated_context_rejects_unexpected_success_url(tmp_path, monkeypatch, url):
+    page = SimpleNamespace(
+        url=url,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+
+    with pytest.raises(ShelfUnavailable, match="unexpected URL"):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+    context.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_close_failure_after_success_is_named_shelf_failure(tmp_path, monkeypatch):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.close.side_effect = auth_module.PlaywrightError("close failed")
+
+    with pytest.raises(ShelfUnavailable, match="could not be closed"):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_close_failure_does_not_mask_primary_body_failure(tmp_path, monkeypatch):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.close.side_effect = auth_module.PlaywrightError("close failed")
+
+    with pytest.raises(RuntimeError, match="primary failure") as captured:
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            raise RuntimeError("primary failure")
+
+    assert any("close failed" in note for note in captured.value.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_close_failure_does_not_mask_primary_cancellation(tmp_path, monkeypatch):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.close.side_effect = auth_module.PlaywrightError("close failed")
+
+    with pytest.raises(asyncio.CancelledError):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_close_is_not_reclassified(tmp_path, monkeypatch):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.close.side_effect = asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
