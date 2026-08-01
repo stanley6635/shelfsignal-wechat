@@ -42,6 +42,8 @@ def test_shell_contains_every_candidate_once_unchecked_and_in_input_order():
     assert "- [x]" not in markdown.lower()
     assert markdown.count("<!-- shelfsignal:id=a-1 -->") == 1
     assert markdown.count("<!-- shelfsignal:id=a-2 -->") == 1
+    assert markdown.count("## Article · `a-1`") == 1
+    assert markdown.count("## Article · `a-2`") == 1
     assert markdown.index("shelfsignal:id=a-2") < markdown.index("shelfsignal:id=a-1")
     assert validate_briefing(markdown, {"a-1", "a-2"}, True) == ("a-2", "a-1")
 
@@ -68,7 +70,7 @@ def test_shell_bounds_and_escapes_untrusted_markdown_fields():
                 "a-1",
                 title=injection,
                 account_name=injection,
-                source_url=injection,
+                source_url="https://example.invalid/a-1",
                 excerpt=f"```\n{injection}\n</blockquote>" + "x" * 20_000,
                 retrieval_status=injection,
                 ocr_status=injection,
@@ -115,15 +117,15 @@ def test_host_ranking_edit_preserves_integrity():
 @pytest.mark.parametrize(
     ("mutate", "message"),
     [
-        (lambda text: text.replace("<!-- shelfsignal:id=a-2 -->\n", ""), "not attached"),
+        (lambda text: text.replace("<!-- shelfsignal:id=a-2 -->\n", ""), "hidden ID"),
         (
-            lambda text: text.replace(
+            lambda text: text.replace("## Article · `a-2`", "## Article · `invented`").replace(
                 "<!-- shelfsignal:id=a-2 -->", "<!-- shelfsignal:id=invented -->"
             ),
             "invented IDs",
         ),
         (
-            lambda text: text.replace(
+            lambda text: text.replace("## Article · `a-2`", "## Article · `a-1`").replace(
                 "<!-- shelfsignal:id=a-2 -->", "<!-- shelfsignal:id=a-1 -->"
             ),
             "duplicate IDs",
@@ -138,8 +140,8 @@ def test_host_ranking_edit_preserves_integrity():
             "adjacent",
         ),
         (
-            lambda text: text.replace("## Article\n", "## Renamed\n", 1),
-            "article section",
+            lambda text: text.replace("## Article · `a-1`\n", "## Renamed\n", 1),
+            "not attached",
         ),
     ],
 )
@@ -147,6 +149,118 @@ def test_validator_rejects_integrity_breaks(mutate, message):
     markdown = create_briefing_shell("run-001", (card("a-1"), card("a-2")))
     with pytest.raises(BriefingError, match=message):
         validate_briefing(mutate(markdown), {"a-1", "a-2"}, True)
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["Title", "Account", "Published", "Source", "Retrieval", "OCR"],
+)
+def test_validator_rejects_deleted_or_duplicate_visible_field(field: str):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    line = next(item for item in markdown.splitlines() if item.startswith(f"- {field}: "))
+
+    with pytest.raises(BriefingError, match=f"{field} field"):
+        validate_briefing(markdown.replace(f"{line}\n", "", 1), {"a-1"}, True)
+    with pytest.raises(BriefingError, match="decoy or duplicate article field"):
+        validate_briefing(markdown + f"{line}\n", {"a-1"}, True)
+
+
+def test_validator_rejects_deleted_or_duplicate_evidence():
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    evidence = next(item for item in markdown.splitlines() if item.startswith("> Evidence: "))
+    with pytest.raises(BriefingError, match="Evidence field"):
+        validate_briefing(markdown.replace(f"{evidence}\n", "", 1), {"a-1"}, True)
+    with pytest.raises(BriefingError, match="decoy or duplicate article field"):
+        validate_briefing(markdown + f"{evidence}\n", {"a-1"}, True)
+
+
+def test_validator_rejects_header_hidden_id_mismatch():
+    markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    mismatched = markdown.replace("## Article · `a-2`", "## Article · `a-1`", 1)
+    with pytest.raises(BriefingError, match="header and hidden ID differ"):
+        validate_briefing(mismatched, {"a-1", "a-2"}, True)
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "- Source: \"http://example.invalid/a-1\"",
+        "- Source: \"https://user@example.invalid/a-1\"",
+        "- Source: not-json",
+        "- Source: \"https://example.invalid/a-1\" trailing",
+    ],
+)
+def test_validator_rejects_missing_or_malformed_source(replacement: str):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    original = next(
+        item for item in markdown.splitlines() if item.startswith("- Source: ")
+    )
+    with pytest.raises(BriefingError, match="Source field"):
+        validate_briefing(markdown.replace(original, replacement), {"a-1"}, True)
+    with pytest.raises(BriefingError, match="Source field"):
+        validate_briefing(markdown.replace(f"{original}\n", "", 1), {"a-1"}, True)
+
+    with pytest.raises(BriefingError, match="decoy or duplicate article field"):
+        validate_briefing(markdown + "- Source : https://example.invalid/decoy\n", {"a-1"}, True)
+
+
+@pytest.mark.parametrize(
+    ("opening", "closing"),
+    [
+        ("```", "```"),
+        ("`````python", "`````"),
+        ("~~~ markdown", "~~~"),
+        ("<!-- outer comment", "-->"),
+    ],
+)
+def test_validator_rejects_article_controls_wrapped_in_fence_or_comment(
+    opening: str, closing: str
+):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    lines = markdown.splitlines()
+    start = lines.index("## Article · `a-1`")
+    wrapped = lines[:start] + [opening] + lines[start:] + [closing]
+    tampered = "\n".join(wrapped) + "\n"
+
+    with pytest.raises(BriefingError, match="fenced code|HTML comment"):
+        validate_briefing(tampered, {"a-1"}, True)
+    checked = tampered.replace("- [ ] **Select**", "- [x] **Select**", 1)
+    with pytest.raises(BriefingError, match="fenced code|HTML comment"):
+        selected_ids(checked, {"a-1"})
+
+
+def test_validator_rejects_checked_decoy_in_fence_or_multiline_comment():
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    for decoy in (
+        "\n```\n## Article · `decoy`\n<!-- shelfsignal:id=decoy -->\n- [x] **Select**\n```\n",
+        "\n<!-- outer\n## Article · `decoy`\n<!-- shelfsignal:id=decoy -->\n- [x] **Select**\n-->\n",
+    ):
+        with pytest.raises(BriefingError, match="fenced code|HTML comment"):
+            selected_ids(markdown + decoy, {"a-1"})
+
+
+def test_renderer_rejects_unsafe_source_url():
+    with pytest.raises(BriefingError, match="safe HTTPS"):
+        create_briefing_shell(
+            "run-1", (card("a-1", source_url="javascript:alert(1)"),)
+        )
+    with pytest.raises(BriefingError, match="too long"):
+        create_briefing_shell(
+            "run-1",
+            (card("a-1", source_url="https://example.invalid/" + "x" * 5_000),),
+        )
+    for source in ("https://localhost/a-1", "https://127.0.0.1/a-1"):
+        with pytest.raises(BriefingError, match="safe HTTPS"):
+            create_briefing_shell("run-1", (card("a-1", source_url=source),))
+
+
+def test_selected_ids_contract_requires_manifest_expected_ids(tmp_path: Path):
+    markdown = create_briefing_shell("run-1", (card("a-1"), card("a-2")))
+    checked = markdown.replace("- [ ] **Select**", "- [x] **Select**", 1)
+    manifest = write_run_manifest(("a-1", "a-2"), tmp_path / "manifest.md")
+    expected = read_run_manifest(manifest)
+
+    assert selected_ids(checked, expected) == ("a-1",)
 
 
 def test_validator_rejects_duplicate_expected_ids_and_decoy_controls():
@@ -178,10 +292,14 @@ def test_selected_ids_requires_expected_set_and_rejects_tampering():
     checked = markdown.replace("- [ ] **Select**", "- [x] **Select**", 1)
     assert selected_ids(checked, {"a-1", "a-2"}) == ("a-1",)
 
-    invented = checked.replace("shelfsignal:id=a-2", "shelfsignal:id=invented")
+    invented = checked.replace("`a-2`", "`invented`", 1).replace(
+        "shelfsignal:id=a-2", "shelfsignal:id=invented"
+    )
     with pytest.raises(BriefingError, match="invented IDs"):
         selected_ids(invented, {"a-1", "a-2"})
-    duplicate = checked.replace("shelfsignal:id=a-2", "shelfsignal:id=a-1")
+    duplicate = checked.replace("`a-2`", "`a-1`", 1).replace(
+        "shelfsignal:id=a-2", "shelfsignal:id=a-1"
+    )
     with pytest.raises(BriefingError, match="duplicate IDs"):
         selected_ids(duplicate, {"a-1", "a-2"})
     unattached = checked + "\n- [x] **Select**\n"

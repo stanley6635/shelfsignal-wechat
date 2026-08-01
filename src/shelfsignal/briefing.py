@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
@@ -8,6 +9,7 @@ from collections import Counter
 from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from .content import atomic_write
 from .models import ReadingCard
@@ -17,6 +19,9 @@ _ID_LINE = re.compile(r"<!-- shelfsignal:id=([A-Za-z0-9][A-Za-z0-9_.:-]{0,127}) 
 _CHECK_LINE = re.compile(r"- \[([ xX])\] \*\*Select\*\*\Z")
 _MANIFEST_ITEM = re.compile(r"- `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
 _RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\Z")
+_ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
+_DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _MAX_CARDS = 2_000
 _MAX_WARNINGS = 200
 _MAX_WARNING_CHARACTERS = 1_000
@@ -67,6 +72,35 @@ def _utc_instant(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _safe_source_url(value: str) -> bool:
+    if "\\" in value or any(character.isspace() for character in value):
+        return False
+    try:
+        parsed = urlparse(value)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (hostname or "").rstrip(".")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        return False
+    return bool(
+        parsed.scheme == "https"
+        and host
+        and host.lower() != "localhost"
+        and len(host) <= 253
+        and "." in host
+        and all(_DNS_LABEL.fullmatch(label) for label in host.split("."))
+        and parsed.username is None
+        and parsed.password is None
+        and port is None
+    )
+
+
 def create_briefing_shell(
     run_id: str,
     cards: tuple[ReadingCard, ...],
@@ -101,7 +135,13 @@ def create_briefing_shell(
         account = _bounded_text(
             card.account_name, _MAX_ACCOUNT_CHARACTERS, "account name"
         )
-        source_url = _bounded_text(card.source_url, _MAX_URL_CHARACTERS, "source URL")
+        if not isinstance(card.source_url, str):
+            raise BriefingError("source URL must be text")
+        if len(card.source_url) > _MAX_URL_CHARACTERS:
+            raise BriefingError("Source URL is too long")
+        source_url = card.source_url
+        if not _safe_source_url(source_url):
+            raise BriefingError("Source must be a safe HTTPS URL")
         retrieval = _bounded_text(
             card.retrieval_status, _MAX_STATUS_CHARACTERS, "retrieval status"
         )
@@ -110,7 +150,7 @@ def create_briefing_shell(
         published = _utc_instant(card.published_at).isoformat()
         lines.extend(
             [
-                "## Article",
+                f"## Article · `{card.article_id}`",
                 f"<!-- shelfsignal:id={card.article_id} -->",
                 "- [ ] **Select**",
                 f"- Title: {_markdown_string(title)}",
@@ -148,6 +188,93 @@ def _expected_id_tuple(expected_ids: Collection[str]) -> tuple[str, ...]:
     return values
 
 
+_VISIBLE_FIELDS = (
+    ("Title", _MAX_TITLE_CHARACTERS),
+    ("Account", _MAX_ACCOUNT_CHARACTERS),
+    ("Published", 64),
+    ("Source", _MAX_URL_CHARACTERS),
+    ("Retrieval", _MAX_STATUS_CHARACTERS),
+    ("OCR", _MAX_STATUS_CHARACTERS),
+)
+_ARTICLE_CONTROL_PREFIXES = (
+    "## Article",
+    "<!-- shelfsignal:id=",
+    "> Evidence",
+    *tuple(f"- {label}" for label, _ in _VISIBLE_FIELDS),
+)
+
+
+def _looks_like_article_control(line: str) -> bool:
+    stripped = line.lstrip()
+    return bool(
+        stripped.startswith(_ARTICLE_CONTROL_PREFIXES)
+        or _CHECK_LINE.fullmatch(stripped)
+    )
+
+
+def _reject_wrapped_controls(lines: list[str]) -> None:
+    fence: tuple[str, int] | None = None
+    in_comment = False
+    for line in lines:
+        if fence is not None:
+            if _looks_like_article_control(line):
+                raise BriefingError("article control is inside fenced code")
+            character, length = fence
+            if re.fullmatch(rf" {{0,3}}{re.escape(character)}{{{length},}}\s*", line):
+                fence = None
+            continue
+        if in_comment:
+            if _looks_like_article_control(line):
+                raise BriefingError("article control is inside an outer HTML comment")
+            if "-->" in line:
+                in_comment = False
+            continue
+
+        opening = _FENCE_OPEN.match(line)
+        if opening:
+            marker = opening.group(1)
+            fence = (marker[0], len(marker))
+            continue
+
+        if "<!--" in line and _ID_LINE.fullmatch(line) is None:
+            if _looks_like_article_control(line):
+                raise BriefingError("article control is inside an outer HTML comment")
+            after_open = line.split("<!--", 1)[1]
+            if "-->" not in after_open:
+                in_comment = True
+
+    if fence is not None:
+        raise BriefingError("unterminated fenced code block")
+    if in_comment:
+        raise BriefingError("unterminated outer HTML comment")
+
+
+def _parse_json_field(line: str, label: str, limit: int) -> str:
+    prefix = f"- {label}: "
+    if not line.startswith(prefix):
+        raise BriefingError(f"missing or misplaced {label} field")
+    try:
+        value = json.loads(line[len(prefix) :])
+    except json.JSONDecodeError as exc:
+        raise BriefingError(f"malformed {label} field") from exc
+    if not isinstance(value, str) or len(value) > limit:
+        raise BriefingError(f"malformed {label} field")
+    return value
+
+
+def _parse_evidence(line: str) -> str:
+    prefix = "> Evidence: "
+    if not line.startswith(prefix):
+        raise BriefingError("missing or misplaced Evidence field")
+    try:
+        value = json.loads(line[len(prefix) :])
+    except json.JSONDecodeError as exc:
+        raise BriefingError("malformed Evidence field") from exc
+    if not isinstance(value, str) or len(value) > _MAX_EXCERPT_CHARACTERS:
+        raise BriefingError("malformed Evidence field")
+    return value
+
+
 def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
     if not isinstance(markdown, str):
         raise BriefingError("briefing must be text")
@@ -159,35 +286,55 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
         raise BriefingError("invalid briefing run header")
     if sum(line.startswith("# WeChat briefing ·") for line in lines) != 1:
         raise BriefingError("duplicate briefing run header")
-    pairs: list[tuple[str, str]] = []
-    article_headers = 0
-    for index, line in enumerate(lines):
-        if line == "## Article":
-            article_headers += 1
-        if line.lstrip().startswith("<!-- shelfsignal:id="):
-            match = _ID_LINE.fullmatch(line)
-            if match is None:
-                raise BriefingError("malformed article ID marker")
-            if index == 0 or lines[index - 1] != "## Article":
-                raise BriefingError("article ID is not in an article section")
-            if index + 1 >= len(lines):
-                raise BriefingError(f"missing checkbox for {match.group(1)}")
-            check = _CHECK_LINE.fullmatch(lines[index + 1])
-            if check is None:
-                raise BriefingError(
-                    f"article ID and checkbox must be adjacent: {match.group(1)}"
-                )
-            pairs.append((match.group(1), check.group(1)))
-            if len(pairs) > _MAX_CARDS:
-                raise BriefingError(f"too many article controls; maximum is {_MAX_CARDS}")
-        check = _CHECK_LINE.fullmatch(line)
-        if check is not None and (
-            index == 0 or _ID_LINE.fullmatch(lines[index - 1]) is None
-        ):
-            raise BriefingError("Select checkbox is not attached to an article ID")
+    _reject_wrapped_controls(lines)
 
-    if article_headers != len(pairs):
-        raise BriefingError("article section is missing an ID and checkbox")
+    pairs: list[tuple[str, str]] = []
+    canonical_indices: set[int] = set()
+    for index, line in enumerate(lines):
+        if not line.startswith("## Article"):
+            continue
+        header = _ARTICLE_HEADER.fullmatch(line)
+        if header is None:
+            raise BriefingError("malformed article section header")
+        if index + 12 >= len(lines):
+            raise BriefingError("incomplete canonical article section")
+        hidden = _ID_LINE.fullmatch(lines[index + 1])
+        if hidden is None:
+            raise BriefingError("article header is not followed by a hidden ID")
+        if header.group(1) != hidden.group(1):
+            raise BriefingError("article header and hidden ID differ")
+        check = _CHECK_LINE.fullmatch(lines[index + 2])
+        if check is None:
+            raise BriefingError("article ID and checkbox must be adjacent")
+
+        values: dict[str, str] = {}
+        for offset, (label, limit) in enumerate(_VISIBLE_FIELDS, start=3):
+            values[label] = _parse_json_field(lines[index + offset], label, limit)
+        try:
+            published = datetime.fromisoformat(values["Published"])
+        except ValueError as exc:
+            raise BriefingError("malformed Published field") from exc
+        _utc_instant(published)
+        if not _safe_source_url(values["Source"]):
+            raise BriefingError("malformed Source field: expected safe HTTPS URL")
+        if lines[index + 9] != "":
+            raise BriefingError("missing separator before Evidence field")
+        _parse_evidence(lines[index + 10])
+        if lines[index + 11] != "" or lines[index + 12] != "### Agent ranking":
+            raise BriefingError("missing canonical Agent ranking section")
+
+        canonical_indices.update(range(index, index + 11))
+        pairs.append((hidden.group(1), check.group(1)))
+        if len(pairs) > _MAX_CARDS:
+            raise BriefingError(f"too many article controls; maximum is {_MAX_CARDS}")
+
+    for index, line in enumerate(lines):
+        if index in canonical_indices:
+            continue
+        if _CHECK_LINE.fullmatch(line) or _ID_LINE.fullmatch(line):
+            raise BriefingError("article control is not attached to a canonical article")
+        if _looks_like_article_control(line):
+            raise BriefingError("decoy or duplicate article field/control")
     return tuple(pairs)
 
 
@@ -214,6 +361,7 @@ def validate_briefing(
 
 
 def selected_ids(markdown: str, expected_ids: Collection[str]) -> tuple[str, ...]:
+    """Return checked IDs only after validating against manifest-derived IDs."""
     validate_briefing(markdown, expected_ids, require_unchecked=False)
     return tuple(
         article_id
