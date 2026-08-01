@@ -173,7 +173,7 @@ def test_validator_rejects_deleted_or_duplicate_visible_field(field: str):
 def test_validator_rejects_deleted_or_duplicate_evidence():
     markdown = create_briefing_shell("run-1", (card("a-1"),))
     expected = bindings(markdown)
-    evidence = next(item for item in markdown.splitlines() if item.startswith("> Evidence: "))
+    evidence = next(item for item in markdown.splitlines() if item.startswith("- Evidence: "))
     with pytest.raises(BriefingError, match="Evidence field"):
         validate_briefing(markdown.replace(f"{evidence}\n", "", 1), expected, True)
     with pytest.raises(BriefingError, match="decoy or duplicate article field"):
@@ -270,6 +270,45 @@ def test_validator_rejects_raw_html_anywhere(raw_html: str):
         validate_briefing(tampered, expected, True)
     with pytest.raises(BriefingError, match="raw HTML"):
         selected_ids(tampered.replace("- [ ] **Select**", "- [x] **Select**"), expected)
+
+
+@pytest.mark.parametrize("raw", ["<div hidden", "<![CDATA[hidden]]>", "<!ENTITY x>", "stray >"])
+def test_validator_rejects_incomplete_html_and_stray_delimiters(raw: str):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
+
+    with pytest.raises(BriefingError, match="raw HTML delimiter"):
+        validate_briefing(markdown + raw + "\n", expected, True)
+
+
+@pytest.mark.parametrize(
+    ("original", "noncanonical"),
+    [
+        ('- Title: "Title a-1"', '- Title: "Title \\u0061-1"'),
+        (
+            '- Source: "https://example.invalid/a-1"',
+            '- Source: "https:\\/\\/example.invalid\\/a-1"',
+        ),
+        ('- Evidence: "Compact evidence."', '- Evidence: "\\u0043ompact evidence."'),
+    ],
+)
+def test_validator_rejects_noncanonical_json_encodings(
+    original: str, noncanonical: str
+):
+    markdown = create_briefing_shell("run-1", (card("a-1"),))
+    expected = bindings(markdown)
+
+    with pytest.raises(BriefingError, match="non-canonical"):
+        validate_briefing(markdown.replace(original, noncanonical, 1), expected, True)
+
+
+def test_normal_unicode_renderer_output_is_canonical():
+    markdown = create_briefing_shell(
+        "run-1",
+        (card("a-1", title="中文标题", account_name="示例账号", excerpt="中文证据。"),),
+    )
+
+    assert validate_briefing(markdown, bindings(markdown), True) == ("a-1",)
 
 
 def test_manifest_digest_binds_visible_payload_and_id_markers():

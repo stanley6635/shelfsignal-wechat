@@ -26,9 +26,6 @@ _RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:-]{0,12
 _ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
-_RAW_HTML_TAG = re.compile(
-    r"<\s*/?\s*[A-Za-z][A-Za-z0-9-]*(?:\s+[^>]*)?\s*/?>", re.IGNORECASE
-)
 _MAX_CARDS = 2_000
 _MAX_WARNINGS = 200
 _MAX_WARNING_CHARACTERS = 1_000
@@ -136,7 +133,7 @@ def create_briefing_shell(
     lines = [
         f"# WeChat briefing · {run_id}",
         "",
-        "> Every candidate is visible. Ranking never preselects an article.",
+        "Every candidate is visible. Ranking never preselects an article.",
         "",
     ]
     if warnings:
@@ -187,7 +184,7 @@ def create_briefing_shell(
                 f"- Retrieval: {_markdown_string(retrieval)}",
                 f"- OCR: {_markdown_string(ocr)}",
                 "",
-                f"> Evidence: {_markdown_string(excerpt)}",
+                f"- Evidence: {_markdown_string(excerpt)}",
                 "",
                 "### Agent ranking",
                 "",
@@ -230,7 +227,7 @@ _ARTICLE_CONTROL_PREFIXES = (
     "## Article",
     "<!-- shelfsignal:id=",
     "<!-- shelfsignal:digest=",
-    "> Evidence",
+    "- Evidence",
     *tuple(f"- {label}" for label, _ in _VISIBLE_FIELDS),
 )
 
@@ -288,39 +285,39 @@ def _reject_raw_html(lines: list[str]) -> None:
     for line in lines:
         if _ID_LINE.fullmatch(line) or _DIGEST_LINE.fullmatch(line):
             continue
-        if (
-            "<!--" in line
-            or "-->" in line
-            or "<!DOCTYPE" in line.upper()
-            or "<?" in line
-            or _RAW_HTML_TAG.search(line)
-        ):
-            raise BriefingError("raw HTML is not allowed in a briefing")
+        if "<" in line or ">" in line:
+            raise BriefingError("raw HTML delimiter is not allowed in a briefing")
 
 
 def _parse_json_field(line: str, label: str, limit: int) -> str:
     prefix = f"- {label}: "
     if not line.startswith(prefix):
         raise BriefingError(f"missing or misplaced {label} field")
+    suffix = line[len(prefix) :]
     try:
-        value = json.loads(line[len(prefix) :])
+        value = json.loads(suffix)
     except json.JSONDecodeError as exc:
         raise BriefingError(f"malformed {label} field") from exc
     if not isinstance(value, str) or len(value) > limit:
         raise BriefingError(f"malformed {label} field")
+    if suffix != _markdown_string(value):
+        raise BriefingError(f"non-canonical {label} field encoding")
     return value
 
 
 def _parse_evidence(line: str) -> str:
-    prefix = "> Evidence: "
+    prefix = "- Evidence: "
     if not line.startswith(prefix):
         raise BriefingError("missing or misplaced Evidence field")
+    suffix = line[len(prefix) :]
     try:
-        value = json.loads(line[len(prefix) :])
+        value = json.loads(suffix)
     except json.JSONDecodeError as exc:
         raise BriefingError("malformed Evidence field") from exc
     if not isinstance(value, str) or len(value) > _MAX_EXCERPT_CHARACTERS:
         raise BriefingError("malformed Evidence field")
+    if suffix != _markdown_string(value):
+        raise BriefingError("non-canonical Evidence field encoding")
     return value
 
 
