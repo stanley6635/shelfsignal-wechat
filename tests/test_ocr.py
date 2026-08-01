@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -92,6 +93,21 @@ def test_image_dimensions_reject_symlink_and_huge_values(
     with pytest.raises(ValueError, match="dimensions"):
         image_evidence(image)
 
+    class ExcessiveArea:
+        stdout = "pixelWidth: 10000\npixelHeight: 5000\n"
+
+    monkeypatch.setattr("shelfsignal.ocr.subprocess.run", lambda *args, **kwargs: ExcessiveArea())
+    with pytest.raises(ValueError, match="dimensions"):
+        image_evidence(image)
+
+
+def test_image_input_is_capped_at_collector_limit(tmp_path: Path):
+    image = tmp_path / "oversized.jpg"
+    with image.open("wb") as stream:
+        stream.truncate(25 * 1024 * 1024 + 1)
+    with pytest.raises(ValueError, match="unsafe image"):
+        image_sha256(image)
+
 
 def test_image_hash_rejects_symlink(tmp_path: Path):
     image = tmp_path / "image.jpg"
@@ -106,25 +122,50 @@ def test_run_vision_ocr_uses_bounded_subprocess(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     helper = tmp_path / "helper"
-    helper.write_bytes(b"binary")
+    helper.write_text("#!/bin/sh\nprintf ' recognized text \\n'\n", encoding="utf-8")
     helper.chmod(0o700)
     image = tmp_path / "image.jpg"
     image.write_bytes(b"fictional")
-
-    class Result:
-        stdout = " recognized text \n"
-
-    calls: list[tuple[list[str], dict[str, object]]] = []
-
-    def fake_run(command: list[str], **kwargs: object) -> Result:
-        calls.append((command, kwargs))
-        return Result()
-
-    monkeypatch.setattr("shelfsignal.ocr.subprocess.run", fake_run)
+    monkeypatch.setattr(
+        "shelfsignal.ocr.image_evidence", lambda path: ImageEvidence(path, 1200, 8000)
+    )
     assert run_vision_ocr(helper, image) == "recognized text"
-    assert calls[0][0] == [str(helper), str(image)]
-    assert calls[0][1]["timeout"] == 120
-    assert calls[0][1]["check"] is True
+
+
+def test_run_vision_ocr_bounds_stdout_while_helper_is_running(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    helper = tmp_path / "helper"
+    helper.write_text("#!/bin/sh\nwhile :; do printf '0123456789'; done\n", encoding="utf-8")
+    helper.chmod(0o700)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"fictional")
+    monkeypatch.setattr(
+        "shelfsignal.ocr.image_evidence", lambda path: ImageEvidence(path, 1200, 8000)
+    )
+    monkeypatch.setattr("shelfsignal.ocr._MAX_IMAGE_OCR_BYTES", 4096)
+
+    with pytest.raises(ValueError, match="output exceeds"):
+        run_vision_ocr(helper, image)
+
+
+def test_run_vision_ocr_kills_helper_on_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    helper = tmp_path / "helper"
+    helper.write_text("#!/bin/sh\nsleep 10\n", encoding="utf-8")
+    helper.chmod(0o700)
+    image = tmp_path / "image.jpg"
+    image.write_bytes(b"fictional")
+    monkeypatch.setattr(
+        "shelfsignal.ocr.image_evidence", lambda path: ImageEvidence(path, 1200, 8000)
+    )
+    monkeypatch.setattr("shelfsignal.ocr._VISION_TIMEOUT_SECONDS", 0.05)
+
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        run_vision_ocr(helper, image)
+    assert time.monotonic() - started < 2
 
 
 def test_ensure_helper_compiles_once_and_rejects_symlink_cache(
@@ -146,6 +187,15 @@ def test_ensure_helper_compiles_once_and_rejects_symlink_cache(
     assert first == second
     assert calls == 1
     assert first.stat().st_mode & 0o111
+    marker = build_dir / "shelfsignal-vision-ocr.sha256"
+    original_marker = marker.read_text(encoding="utf-8")
+    assert len(original_marker.strip()) == 64
+
+    marker.write_text("0" * 64 + "\n", encoding="utf-8")
+    third = ensure_helper(build_dir)
+    assert third == first
+    assert calls == 2
+    assert marker.read_text(encoding="utf-8") == original_marker
 
     first.unlink()
     outside = tmp_path / "outside"
@@ -204,6 +254,52 @@ def test_ocr_records_partial_failure_and_continues(tmp_path: Path):
     rendered = result.read_text(encoding="utf-8")
     assert "OCR incomplete: TimeoutExpired" in rendered
     assert "visible evidence" in rendered
+
+
+def test_ocr_enforces_per_article_image_count(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr("shelfsignal.ocr._MAX_OCR_IMAGES", 2)
+    article_dir = tmp_path / "article"
+    article_dir.mkdir()
+    images = []
+    for index in range(3):
+        path = tmp_path / f"image-{index}.jpg"
+        path.write_bytes(f"image-{index}".encode())
+        images.append(ImageEvidence(path, 1200, 8000))
+    calls = 0
+
+    def runner(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return path.name
+
+    result = ocr_article(article_dir, tuple(images), 10, tmp_path / "cache", runner)
+    assert result is not None
+    rendered = result.read_text(encoding="utf-8")
+    assert calls == 2
+    assert "OCR incomplete: 1 image not processed (limit 2)" in rendered
+
+
+def test_ocr_enforces_total_text_budget(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr("shelfsignal.ocr._MAX_ARTICLE_OCR_BYTES", 20)
+    article_dir = tmp_path / "article"
+    article_dir.mkdir()
+    images = []
+    for index in range(2):
+        path = tmp_path / f"image-{index}.jpg"
+        path.write_bytes(f"image-{index}".encode())
+        images.append(ImageEvidence(path, 1200, 8000))
+
+    result = ocr_article(
+        article_dir,
+        tuple(images),
+        10,
+        tmp_path / "cache",
+        lambda path: "x" * 15,
+    )
+    assert result is not None
+    rendered = result.read_text(encoding="utf-8")
+    assert rendered.count("x" * 15) == 1
+    assert "OCR incomplete: article text budget exceeded" in rendered
 
 
 def test_ocr_does_not_swallow_cancellation_or_replace_existing_result(tmp_path: Path):

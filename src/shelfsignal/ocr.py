@@ -4,8 +4,11 @@ import hashlib
 import os
 import re
 import secrets
+import selectors
+import signal
 import stat
 import subprocess
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from importlib.resources import as_file, files
@@ -13,10 +16,18 @@ from pathlib import Path
 
 from .content import _open_directory, atomic_write, ensure_safe_directory
 
-_MAX_IMAGE_DIMENSION = 100_000
-_MAX_IMAGE_BYTES = 512 * 1024 * 1024
+# Decode guardrails: match the collector's 25 MiB asset ceiling, then cap a
+# decoded raster at 50,000 px on either axis and 40 MP (~160 MiB RGBA).
+_MAX_IMAGE_BYTES = 25 * 1024 * 1024
+_MAX_IMAGE_DIMENSION = 50_000
+_MAX_IMAGE_PIXELS = 40_000_000
 _MAX_HELPER_BYTES = 128 * 1024 * 1024
-_MAX_OCR_BYTES = 64 * 1024 * 1024
+# OCR work is bounded independently from source storage: at most 24 images,
+# 2 MiB recognized text per image, and 8 MiB recognized text per article.
+_MAX_OCR_IMAGES = 24
+_MAX_IMAGE_OCR_BYTES = 2 * 1024 * 1024
+_MAX_ARTICLE_OCR_BYTES = 8 * 1024 * 1024
+_VISION_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(frozen=True)
@@ -36,6 +47,8 @@ class ImageEvidence:
                 or value > _MAX_IMAGE_DIMENSION
             ):
                 raise ValueError("image dimensions are outside the supported range")
+        if self.area > _MAX_IMAGE_PIXELS:
+            raise ValueError("image dimensions are outside the supported range")
 
     @property
     def area(self) -> int:
@@ -169,46 +182,109 @@ def run_vision_ocr(helper: Path, image: Path) -> str:
         max_bytes=_MAX_HELPER_BYTES,
         require_executable=True,
     )
-    _validate_regular_file(image, label="image", max_bytes=_MAX_IMAGE_BYTES)
-    result = subprocess.run(
+    # `sips` reads dimensions without asking Vision to decode the full raster.
+    image_evidence(image)
+    return _run_bounded_helper(
         [str(helper), str(image)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=120,
+        timeout=_VISION_TIMEOUT_SECONDS,
+        max_bytes=_MAX_IMAGE_OCR_BYTES,
     )
-    output = result.stdout.strip()
-    if len(output.encode("utf-8")) > _MAX_OCR_BYTES:
-        raise ValueError("OCR output exceeds the supported size")
-    return output
 
 
-def _existing_helper(helper: Path) -> bool:
+def _run_bounded_helper(command: list[str], *, timeout: float, max_bytes: int) -> str:
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    streams = {process.stdout: bytearray(), process.stderr: bytearray()}
+    deadline = time.monotonic() + timeout
+    selector = selectors.DefaultSelector()
     try:
-        details = os.lstat(helper)
-    except FileNotFoundError:
-        return False
-    if not stat.S_ISREG(details.st_mode) or not details.st_mode & 0o111:
-        raise ValueError("unsafe OCR helper cache")
-    _validate_regular_file(
-        helper,
-        label="OCR helper cache",
-        max_bytes=_MAX_HELPER_BYTES,
-        require_executable=True,
-    )
-    return True
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            for key, _ in selector.select(timeout=min(remaining, 0.1)):
+                stream = key.fileobj
+                buffer = streams[stream]
+                chunk = os.read(stream.fileno(), min(64 * 1024, max_bytes - len(buffer) + 1))
+                if not chunk:
+                    selector.unregister(stream)
+                    continue
+                buffer.extend(chunk)
+                if len(buffer) > max_bytes:
+                    raise ValueError("OCR helper output exceeds the supported size")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(command, timeout)
+        return_code = process.wait(timeout=remaining)
+    except BaseException:
+        _kill_process_group(process)
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+        process.stderr.close()
+
+    output = bytes(streams[process.stdout])
+    error = bytes(streams[process.stderr])
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, command, output=output, stderr=error)
+    try:
+        return output.decode("utf-8").strip()
+    except UnicodeDecodeError as exc:
+        raise ValueError("OCR helper returned invalid text") from exc
+
+
+def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def _helper_matches_source(helper: Path, marker: Path, source_digest: str) -> bool:
+    helper_exists = os.path.lexists(helper)
+    marker_exists = os.path.lexists(marker)
+    if helper_exists:
+        _validate_regular_file(
+            helper,
+            label="OCR helper cache",
+            max_bytes=_MAX_HELPER_BYTES,
+            require_executable=True,
+        )
+    if marker_exists:
+        try:
+            recorded_digest = _read_regular_bytes(
+                marker, label="OCR helper cache marker", max_bytes=128
+            ).decode("ascii").strip()
+        except UnicodeDecodeError:
+            recorded_digest = ""
+    else:
+        recorded_digest = ""
+    return helper_exists and marker_exists and recorded_digest == source_digest
 
 
 def ensure_helper(build_dir: Path) -> Path:
     build_dir = ensure_safe_directory(build_dir, label="OCR helper build")
     helper = build_dir / "shelfsignal-vision-ocr"
-    if _existing_helper(helper):
+    marker = build_dir / "shelfsignal-vision-ocr.sha256"
+    resource_source = files("shelfsignal").joinpath("resources/vision_ocr.swift")
+    source_digest = hashlib.sha256(resource_source.read_bytes()).hexdigest()
+    if _helper_matches_source(helper, marker, source_digest):
         return helper
 
     temporary = build_dir / f".shelfsignal-vision-ocr.{secrets.token_hex(8)}"
-    resource = files("shelfsignal").joinpath("resources/vision_ocr.swift")
     try:
-        with as_file(resource) as source:
+        with as_file(resource_source) as source:
             subprocess.run(
                 ["swiftc", str(source), "-o", str(temporary)],
                 check=True,
@@ -222,9 +298,10 @@ def ensure_helper(build_dir: Path) -> Path:
             max_bytes=_MAX_HELPER_BYTES,
         )
         os.chmod(temporary, 0o700, follow_symlinks=False)
-        if _existing_helper(helper):
+        if _helper_matches_source(helper, marker, source_digest):
             return helper
         os.replace(temporary, helper)
+        atomic_write(marker, f"{source_digest}\n".encode("ascii"))
         return helper
     finally:
         try:
@@ -233,16 +310,22 @@ def ensure_helper(build_dir: Path) -> Path:
             pass
 
 
-def _read_cached_text(path: Path) -> str:
-    descriptor = _open_regular_file(path, label="OCR cache file", max_bytes=_MAX_OCR_BYTES)
+def _read_regular_bytes(path: Path, *, label: str, max_bytes: int) -> bytes:
+    descriptor = _open_regular_file(path, label=label, max_bytes=max_bytes)
     chunks: list[bytes] = []
     try:
         while chunk := os.read(descriptor, 1024 * 1024):
             chunks.append(chunk)
     finally:
         os.close(descriptor)
+    return b"".join(chunks)
+
+
+def _read_cached_text(path: Path) -> str:
     try:
-        return b"".join(chunks).decode("utf-8")
+        return _read_regular_bytes(
+            path, label="OCR cache file", max_bytes=_MAX_IMAGE_OCR_BYTES
+        ).decode("utf-8")
     except UnicodeDecodeError as exc:
         raise ValueError("invalid OCR cache text") from exc
 
@@ -250,7 +333,7 @@ def _read_cached_text(path: Path) -> str:
 def _bounded_ocr_text(value: str) -> str:
     if not isinstance(value, str):
         raise TypeError("OCR runner must return text")
-    if len(value.encode("utf-8")) > _MAX_OCR_BYTES:
+    if len(value.encode("utf-8")) > _MAX_IMAGE_OCR_BYTES:
         raise ValueError("OCR output exceeds the supported size")
     return value
 
@@ -272,19 +355,50 @@ def ocr_article(
     article_dir = ensure_safe_directory(article_dir, label="article OCR")
     cache_dir = ensure_safe_directory(cache_dir, label="OCR cache")
     sections = ["# OCR-derived evidence", ""]
-    for image in images:
+    selected_images = images[:_MAX_OCR_IMAGES]
+    text_bytes = 0
+    for index, image in enumerate(selected_images):
         sections.extend([f"## {_safe_heading(image.path)}", ""])
         try:
             digest = image_sha256(image.path)
             cache = cache_dir / f"{digest}.txt"
             if os.path.lexists(cache):
                 text = _read_cached_text(cache)
+                cache_missing = False
             else:
                 text = _bounded_ocr_text(runner(image.path))
+                cache_missing = True
+            encoded_text = text.strip().encode("utf-8")
+            if text_bytes + len(encoded_text) > _MAX_ARTICLE_OCR_BYTES:
+                sections.extend(["OCR incomplete: article text budget exceeded", ""])
+                remaining = len(images) - index - 1
+                if remaining:
+                    sections.extend(
+                        [
+                            "## Additional images",
+                            "",
+                            f"OCR incomplete: {remaining} image(s) not processed after budget limit",
+                            "",
+                        ]
+                    )
+                break
+            if cache_missing:
                 atomic_write(cache, (text.rstrip() + "\n").encode("utf-8"))
+            text_bytes += len(encoded_text)
             sections.extend([text.strip(), ""])
         except Exception as exc:  # noqa: BLE001 - one image failure remains visible and nonfatal
             sections.extend([f"OCR incomplete: {type(exc).__name__}", ""])
+    else:
+        remaining = len(images) - len(selected_images)
+        if remaining:
+            sections.extend(
+                [
+                    "## Additional images",
+                    "",
+                    f"OCR incomplete: {remaining} image not processed (limit {_MAX_OCR_IMAGES})",
+                    "",
+                ]
+            )
     destination = article_dir / "ocr.md"
     atomic_write(destination, ("\n".join(sections).rstrip() + "\n").encode("utf-8"))
     return destination
