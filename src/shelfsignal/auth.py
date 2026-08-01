@@ -217,13 +217,31 @@ def classify_shelf_probe(status: int) -> None:
 
 
 async def _probe_shelf(page):
-    try:
-        response = await page.goto(SHELF_URL, wait_until="domcontentloaded")
-    except PlaywrightError as exc:
-        raise ShelfUnavailable("WeRead shelf could not be reached") from exc
+    response = await _await_playwright_phase(
+        page.goto(SHELF_URL, wait_until="domcontentloaded"),
+        unavailable_message="WeRead shelf could not be reached",
+    )
     if response is None:
         raise ShelfUnavailable("WeRead shelf returned no HTTP response")
     return page.url, response.status
+
+
+async def _await_playwright_phase(
+    operation,
+    *,
+    unavailable_message: str,
+    qr_timeout: bool = False,
+):
+    try:
+        return await operation
+    except asyncio.CancelledError:
+        raise
+    except PlaywrightTimeoutError as exc:
+        if qr_timeout:
+            raise AuthRequired("WeRead QR authorization timed out") from exc
+        raise ShelfUnavailable(unavailable_message) from exc
+    except PlaywrightError as exc:
+        raise ShelfUnavailable(unavailable_message) from exc
 
 
 def _handle_cleanup_failure(
@@ -283,36 +301,45 @@ async def authenticated_context(
 
     manager_primary_error: BaseException | None = None
     try:
-        try:
-            context = await playwright.chromium.launch_persistent_context(
+        context = await _await_playwright_phase(
+            playwright.chromium.launch_persistent_context(
                 user_data_dir=profile,
                 headless=False,
-            )
-        except PlaywrightError as exc:
-            raise ShelfUnavailable("WeRead browser context could not be started") from exc
+            ),
+            unavailable_message="WeRead browser context could not be started",
+        )
 
         context_primary_error: BaseException | None = None
         try:
-            page = context.pages[0] if context.pages else await context.new_page()
+            page = (
+                context.pages[0]
+                if context.pages
+                else await _await_playwright_phase(
+                    context.new_page(),
+                    unavailable_message="WeRead browser page could not be created",
+                )
+            )
             url, status = await _probe_shelf(page)
             if is_auth_required(url, status):
                 try:
                     async with asyncio.timeout(AUTHORIZATION_TIMEOUT_MS / 1_000):
                         if _trusted_probe_path(url) == "/web/login":
-                            try:
-                                await page.wait_for_url(
+                            await _await_playwright_phase(
+                                page.wait_for_url(
                                     "**/web/shelf**",
                                     timeout=AUTHORIZATION_TIMEOUT_MS,
-                                )
-                            except PlaywrightTimeoutError as exc:
-                                raise AuthRequired(
-                                    "WeRead QR authorization timed out"
-                                ) from exc
+                                ),
+                                unavailable_message="WeRead authorization page became unavailable",
+                                qr_timeout=True,
+                            )
                         while True:
                             url, status = await _probe_shelf(page)
                             if not is_auth_required(url, status):
                                 break
-                            await page.wait_for_timeout(AUTH_POLL_INTERVAL_MS)
+                            await _await_playwright_phase(
+                                page.wait_for_timeout(AUTH_POLL_INTERVAL_MS),
+                                unavailable_message="WeRead authorization page became unavailable",
+                            )
                 except TimeoutError as exc:
                     raise AuthRequired("WeRead QR authorization timed out") from exc
             classify_shelf_probe(status)

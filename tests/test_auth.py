@@ -534,6 +534,67 @@ async def test_manager_enter_failure_before_connection_does_not_call_exit(
     manager.exit.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "launch",
+        "new_page",
+        "goto",
+        "wait_for_url",
+        "wait_for_timeout",
+        "context_close",
+        "manager_exit",
+    ],
+)
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_error"),
+    [("playwright", ShelfUnavailable), ("cancel", asyncio.CancelledError)],
+)
+async def test_playwright_phase_failure_matrix_preserves_domain_and_cleanup(
+    tmp_path, monkeypatch, phase, failure_kind, expected_error
+):
+    failure = (
+        auth_module.PlaywrightError(f"{phase} failed")
+        if failure_kind == "playwright"
+        else asyncio.CancelledError()
+    )
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, launch = install_mock_playwright(monkeypatch, page)
+    manager = context.playwright_manager
+
+    if phase == "launch":
+        launch.side_effect = failure
+    elif phase == "new_page":
+        context.pages = []
+        context.new_page.side_effect = failure
+    elif phase == "goto":
+        page.goto.side_effect = failure
+    elif phase == "wait_for_url":
+        page.url = "https://weread.qq.com/web/login"
+        page.wait_for_url.side_effect = failure
+    elif phase == "wait_for_timeout":
+        page.goto.return_value = SimpleNamespace(status=403)
+        page.wait_for_timeout.side_effect = failure
+    elif phase == "context_close":
+        context.close.side_effect = failure
+    else:
+        manager.exit.side_effect = failure
+
+    with pytest.raises(expected_error) as captured:
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+    assert type(captured.value) is expected_error
+    assert context.close.await_count == (0 if phase == "launch" else 1)
+    manager.exit.assert_awaited_once()
+
+
 @pytest.mark.parametrize(
     ("stage", "failure_type"),
     [
