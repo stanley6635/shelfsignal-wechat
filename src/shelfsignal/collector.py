@@ -1,11 +1,20 @@
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from .content import atomic_write, normalize_html, safe_article_dir, safe_asset_path, write_source
-from .errors import ContentContractUnavailable
+from .content import (
+    atomic_write,
+    ensure_safe_directory,
+    load_stored_article,
+    normalize_html,
+    safe_article_dir,
+    safe_asset_path,
+    write_source,
+)
+from .errors import AuthRequired, ContentContractUnavailable
 from .models import (
     ArticleStatus,
     CollectionOmission,
@@ -29,7 +38,7 @@ async def collect_articles(
     account_ids: set[str] | None = None,
 ) -> CollectionResult:
     _validate_collection_inputs(lookback_days, run_id)
-    library_dir.mkdir(mode=0o700, exist_ok=True)
+    library_dir = ensure_safe_directory(library_dir)
     cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
     stored: list[StoredArticle] = []
     omissions: list[CollectionOmission] = []
@@ -46,7 +55,7 @@ async def collect_articles(
     for account in sorted(accounts, key=lambda item: item.account_id):
         try:
             articles = await client.articles(account)
-        except ContentContractUnavailable:
+        except (AuthRequired, ContentContractUnavailable):
             raise
         except Exception as exc:  # noqa: BLE001 - account failures are visible partial results
             omissions.append(
@@ -94,9 +103,27 @@ async def _collect_one(
     run_id: str,
     omissions: list[CollectionOmission],
 ) -> StoredArticle | None:
+    existing: StoredArticle | None = None
+    prior_artifacts = False
     try:
         directory = safe_article_dir(library_dir, article.article_id)
+        prior_artifacts = _stored_artifacts_present(directory)
+        if prior_artifacts:
+            try:
+                existing = load_stored_article(directory)
+            except (OSError, TypeError, ValueError):
+                pass
+            else:
+                if (
+                    existing.article.article_id != article.article_id
+                    or existing.article.source_url != article.source_url
+                ):
+                    raise ContentContractUnavailable(
+                        "stored article identity conflicts with remote article"
+                    )
         remote_content = await client.content(article)
+        if existing is not None and existing.status is ArticleStatus.COMPLETE:
+            return existing
         normalized = normalize_html(remote_content.html)
         asset_paths: list[Path] = []
         image_urls = tuple(
@@ -108,7 +135,7 @@ async def _collect_one(
                 content = await client.asset(image_url)
                 atomic_write(destination, content)
                 asset_paths.append(destination)
-            except ContentContractUnavailable:
+            except (AuthRequired, ContentContractUnavailable):
                 raise
             except Exception as exc:  # noqa: BLE001 - one asset must not discard source text
                 omissions.append(
@@ -134,12 +161,23 @@ async def _collect_one(
             source_sha256=digest,
             status=ArticleStatus.COMPLETE,
         )
-    except ContentContractUnavailable:
+    except (AuthRequired, ContentContractUnavailable):
         raise
     except Exception as exc:  # noqa: BLE001 - retain a visible metadata-only candidate
         omissions.append(
             CollectionOmission("article", article.article_id, _failure_reason(exc))
         )
+        if existing is not None and existing.status is ArticleStatus.COMPLETE:
+            return existing
+        if prior_artifacts:
+            omissions.append(
+                CollectionOmission(
+                    "article",
+                    article.article_id,
+                    "existing stored article is invalid; placeholder not written",
+                )
+            )
+            return None
 
     try:
         directory = safe_article_dir(library_dir, article.article_id)
@@ -168,6 +206,16 @@ async def _collect_one(
         source_sha256=digest,
         status=ArticleStatus.BODY_UNAVAILABLE,
     )
+
+
+def _stored_artifacts_present(directory: Path) -> bool:
+    for name in ("source.md", "metadata.md"):
+        try:
+            os.lstat(directory / name)
+        except FileNotFoundError:
+            continue
+        return True
+    return False
 
 
 def _validate_collection_inputs(lookback_days: int, run_id: str) -> None:

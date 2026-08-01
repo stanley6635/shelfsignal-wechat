@@ -9,7 +9,12 @@ from urllib.parse import urlsplit
 from playwright.async_api import BrowserContext, Page
 
 from .content import _safe_https_url
-from .errors import ArticleBodyUnavailable, ContentContractUnavailable, ShelfUnavailable
+from .errors import (
+    ArticleBodyUnavailable,
+    AuthRequired,
+    ContentContractUnavailable,
+    ShelfUnavailable,
+)
 from .models import ArticleContent, RemoteArticle, ShelfAccount
 
 SHELF_URL = "https://weread.qq.com/web/shelf"
@@ -53,9 +58,28 @@ class PlaywrightWeReadClient:
             raise
         except Exception as exc:
             raise ShelfUnavailable("saved shelf request failed") from exc
-        if response is None or not response.ok:
-            status = "no response" if response is None else f"HTTP {response.status}"
-            raise ShelfUnavailable(f"saved shelf request failed: {status}")
+        if response is None:
+            raise ShelfUnavailable("saved shelf request failed: no response")
+        response_path = _trusted_path(
+            getattr(response, "url", ""),
+            {"/web/shelf", "/web/login"},
+            ShelfUnavailable,
+            "saved shelf returned an unexpected endpoint",
+        )
+        page_path = _trusted_path(
+            getattr(self.page, "url", ""),
+            {"/web/shelf", "/web/login"},
+            ShelfUnavailable,
+            "saved shelf returned an unexpected endpoint",
+        )
+        status = getattr(response, "status", None)
+        ok = getattr(response, "ok", None)
+        if type(status) is not int or not isinstance(ok, bool):
+            raise ShelfUnavailable("saved shelf returned an invalid response")
+        if response_path == "/web/login" or page_path == "/web/login" or status in {401, 403}:
+            raise AuthRequired("WeRead authorization is required")
+        if not ok:
+            raise ShelfUnavailable(f"saved shelf request failed: HTTP {status}")
         try:
             html = await self.page.content()
         except asyncio.CancelledError:
@@ -69,6 +93,7 @@ class PlaywrightWeReadClient:
             BOOK_READ_URL,
             data={"bookId": account.account_id},
         )
+        _validate_api_response(response, "/web/book/read", "book/read")
         if not response.ok:
             raise ContentContractUnavailable(
                 f"book/read returned HTTP {response.status}"
@@ -80,6 +105,7 @@ class PlaywrightWeReadClient:
             MP_CONTENT_URL,
             params={"reviewId": article.article_id},
         )
+        _validate_api_response(response, "/web/mp/content", "mp/content")
         if response.status == 404:
             raise ArticleBodyUnavailable(
                 f"article body unavailable: {article.article_id}"
@@ -96,17 +122,19 @@ class PlaywrightWeReadClient:
     async def asset(self, url: str) -> bytes:
         if not _safe_https_url(url, image=True):
             raise OSError("unsafe asset URL")
-        response = await self.context.request.get(url)
+        response = await self.context.request.get(url, max_redirects=0)
         status = getattr(response, "status", None)
         ok = getattr(response, "ok", None)
         headers = getattr(response, "headers", None)
         if type(status) is not int or not isinstance(ok, bool) or not isinstance(headers, dict):
             raise OSError("asset returned an invalid response type")
-        if not ok:
-            raise OSError(f"asset returned HTTP {status}")
         final_url = getattr(response, "url", "")
         if not isinstance(final_url, str) or not _safe_https_url(final_url, image=True):
             raise OSError("asset returned an unsafe final URL")
+        if status in {401, 403}:
+            raise AuthRequired("WeRead asset authorization is required")
+        if not ok:
+            raise OSError(f"asset returned HTTP {status}")
 
         raw_content_type = headers.get("content-type", "")
         if not isinstance(raw_content_type, str):
@@ -138,6 +166,42 @@ async def _response_json(response: object, label: str) -> object:
         raise
     except Exception as exc:
         raise ContentContractUnavailable(f"{label} returned invalid JSON") from exc
+
+
+def _validate_api_response(response: object, expected_path: str, label: str) -> None:
+    path = _trusted_path(
+        getattr(response, "url", ""),
+        {expected_path, "/web/login"},
+        ContentContractUnavailable,
+        f"{label} returned an unexpected endpoint",
+    )
+    status = getattr(response, "status", None)
+    ok = getattr(response, "ok", None)
+    if type(status) is not int or not isinstance(ok, bool):
+        raise ContentContractUnavailable(f"{label} returned an invalid response")
+    if path == "/web/login" or status in {401, 403}:
+        raise AuthRequired("WeRead authorization is required")
+
+
+def _trusted_path(
+    url: object,
+    allowed_paths: set[str],
+    error_type: type[Exception],
+    message: str,
+) -> str:
+    if not isinstance(url, str):
+        raise error_type(message)
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise error_type(message) from exc
+    if (
+        parsed.scheme != "https"
+        or parsed.netloc != "weread.qq.com"
+        or parsed.path not in allowed_paths
+    ):
+        raise error_type(message)
+    return parsed.path
 
 
 def _validate_content_length(value: str | None) -> None:

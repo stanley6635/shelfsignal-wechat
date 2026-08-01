@@ -258,6 +258,12 @@ def safe_asset_path(asset_dir: Path, source: str) -> Path:
     return asset_dir / f"{digest}{suffix}"
 
 
+def ensure_safe_directory(directory: Path, *, label: str = "collection") -> Path:
+    descriptor, directory = _open_directory(directory, label, create_final=True)
+    os.close(descriptor)
+    return directory
+
+
 def safe_article_dir(library_dir: Path, article_id: str) -> Path:
     if not _SAFE_ARTICLE_ID.fullmatch(article_id):
         raise ValueError("unsafe article ID")
