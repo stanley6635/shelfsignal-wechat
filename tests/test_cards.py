@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
+import shelfsignal.cards as cards_module
 from shelfsignal.cards import build_card, write_cards
 from shelfsignal.models import ArticleStatus, RemoteArticle, StoredArticle
 
@@ -78,6 +80,33 @@ def test_card_reports_missing_source_and_ocr(tmp_path: Path):
     assert card.excerpt == "[Source unavailable: missing]"
     assert card.ocr_status == "missing"
     assert card.retrieval_status == "ocr_incomplete; source-missing"
+
+
+def test_missing_source_placeholder_respects_one_character_limit(tmp_path: Path):
+    stored = make_stored_article(tmp_path, "article-1")
+    stored.source_path.unlink()
+
+    card = build_card(stored, max_characters=1)
+
+    assert card.excerpt == "…"
+    assert len(card.excerpt) == 1
+
+
+@pytest.mark.parametrize("ocr_path_kind", ["none", "missing"])
+def test_ocr_incomplete_status_is_visible_without_ocr_output(
+    tmp_path: Path, ocr_path_kind: str
+):
+    stored = make_stored_article(tmp_path, "article-1")
+    stored = replace(
+        stored,
+        ocr_path=None if ocr_path_kind == "none" else tmp_path / "ocr.md",
+        status=ArticleStatus.OCR_INCOMPLETE,
+    )
+
+    card = build_card(stored)
+
+    assert card.ocr_status in {"incomplete", "missing"}
+    assert card.ocr_status != "not-needed"
 
 
 def test_card_reports_incomplete_and_available_ocr(tmp_path: Path):
@@ -199,6 +228,76 @@ def test_write_cards_escapes_metadata_markdown_injection(tmp_path: Path):
 
     assert "\n## injected heading" not in text
     assert '"Safe title\\n## injected heading"' in text
+
+
+def test_card_and_writer_bound_untrusted_metadata(tmp_path: Path):
+    stored = make_stored_article(tmp_path / "article", "article-1")
+    huge = "x" * 1_000_000
+    stored = replace(
+        stored,
+        article=replace(
+            stored.article,
+            title=huge,
+            account_name=huge,
+            source_url=f"https://example.invalid/{huge}",
+        ),
+    )
+
+    card = build_card(stored)
+
+    assert card.title.endswith("…")
+    assert card.account_name.endswith("…")
+    assert card.source_url.endswith("…")
+    direct = replace(
+        card,
+        title=huge,
+        account_name=huge,
+        source_url=huge,
+        source_path=Path(huge),
+        excerpt=huge,
+        ocr_status=huge,
+        retrieval_status=huge,
+    )
+    output = write_cards((direct,), tmp_path / "cards.md").read_bytes()
+    assert len(output) <= 32 * 1024
+    assert b"\xe2\x80\xa6" in output
+
+
+def test_write_cards_has_card_count_and_total_artifact_budgets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    stored = make_stored_article(tmp_path / "article", "article-1")
+    card = build_card(stored)
+    too_many = tuple(replace(card, article_id=f"article-{index}") for index in range(2001))
+    with pytest.raises(ValueError, match="too many reading cards"):
+        write_cards(too_many, tmp_path / "many.md")
+
+    monkeypatch.setattr(cards_module, "_MAX_ARTIFACT_BYTES", 200)
+    with pytest.raises(ValueError, match="artifact is too large"):
+        write_cards((card,), tmp_path / "large.md")
+
+
+def test_write_cards_sorts_by_utc_instant_and_rejects_naive_datetime(tmp_path: Path):
+    card = build_card(make_stored_article(tmp_path / "article", "article-base"))
+    later_local_date = replace(
+        card,
+        article_id="later-local-date",
+        published_at=datetime(2026, 8, 1, 0, 30, tzinfo=timezone(timedelta(hours=8))),
+    )
+    earlier_local_date = replace(
+        card,
+        article_id="earlier-local-date",
+        published_at=datetime(2026, 7, 31, 17, 0, tzinfo=UTC),
+    )
+
+    text = write_cards(
+        (earlier_local_date, later_local_date), tmp_path / "ordered.md"
+    ).read_text(encoding="utf-8")
+    assert text.index("## later-local-date") < text.index("## earlier-local-date")
+
+    naive = replace(card, published_at=card.published_at.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        write_cards((naive,), tmp_path / "naive.md")
 
 
 def test_write_cards_rejects_duplicate_ids(tmp_path: Path):

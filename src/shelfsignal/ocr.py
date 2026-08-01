@@ -251,38 +251,27 @@ def _kill_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait()
 
 
-def _helper_matches_source(helper: Path, marker: Path, source_digest: str) -> bool:
-    helper_exists = os.path.lexists(helper)
-    marker_exists = os.path.lexists(marker)
-    if helper_exists:
+def _existing_helper(helper: Path) -> bool:
+    if os.path.lexists(helper):
         _validate_regular_file(
             helper,
             label="OCR helper cache",
             max_bytes=_MAX_HELPER_BYTES,
             require_executable=True,
         )
-    if marker_exists:
-        try:
-            recorded_digest = _read_regular_bytes(
-                marker, label="OCR helper cache marker", max_bytes=128
-            ).decode("ascii").strip()
-        except UnicodeDecodeError:
-            recorded_digest = ""
-    else:
-        recorded_digest = ""
-    return helper_exists and marker_exists and recorded_digest == source_digest
+        return True
+    return False
 
 
 def ensure_helper(build_dir: Path) -> Path:
     build_dir = ensure_safe_directory(build_dir, label="OCR helper build")
-    helper = build_dir / "shelfsignal-vision-ocr"
-    marker = build_dir / "shelfsignal-vision-ocr.sha256"
     resource_source = files("shelfsignal").joinpath("resources/vision_ocr.swift")
     source_digest = hashlib.sha256(resource_source.read_bytes()).hexdigest()
-    if _helper_matches_source(helper, marker, source_digest):
+    helper = build_dir / f"shelfsignal-vision-ocr-{source_digest}"
+    if _existing_helper(helper):
         return helper
 
-    temporary = build_dir / f".shelfsignal-vision-ocr.{secrets.token_hex(8)}"
+    temporary = build_dir / f".{helper.name}.{secrets.token_hex(8)}"
     try:
         with as_file(resource_source) as source:
             subprocess.run(
@@ -298,10 +287,9 @@ def ensure_helper(build_dir: Path) -> Path:
             max_bytes=_MAX_HELPER_BYTES,
         )
         os.chmod(temporary, 0o700, follow_symlinks=False)
-        if _helper_matches_source(helper, marker, source_digest):
+        if _existing_helper(helper):
             return helper
         os.replace(temporary, helper)
-        atomic_write(marker, f"{source_digest}\n".encode("ascii"))
         return helper
     finally:
         try:
@@ -383,7 +371,7 @@ def ocr_article(
                     )
                 break
             if cache_missing:
-                atomic_write(cache, (text.rstrip() + "\n").encode("utf-8"))
+                atomic_write(cache, text.encode("utf-8"))
             text_bytes += len(encoded_text)
             sections.extend([text.strip(), ""])
         except Exception as exc:  # noqa: BLE001 - one image failure remains visible and nonfatal

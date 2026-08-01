@@ -4,20 +4,41 @@ import json
 import os
 import re
 import stat
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .content import atomic_write
-from .models import ReadingCard, StoredArticle
+from .models import ArticleStatus, ReadingCard, StoredArticle
 
 _MAX_CARD_CHARACTERS = 10_000
 _MAX_SOURCE_SCAN_BYTES = 8 * 1024 * 1024
 _MAX_OCR_BYTES = 8 * 1024 * 1024
+_MAX_TITLE_CHARACTERS = 512
+_MAX_ACCOUNT_CHARACTERS = 256
+_MAX_URL_CHARACTERS = 4096
+_MAX_PATH_CHARACTERS = 4096
+_MAX_STATUS_CHARACTERS = 256
+_MAX_CARDS = 2000
+_MAX_SERIALIZED_CARD_BYTES = 96 * 1024
+_MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
 _SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 
 
 def _bounded_excerpt(text: str, limit: int) -> str:
     compact = re.sub(r"\s+", " ", text).strip()
     return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
+
+
+def _bounded_field(value: str, limit: int, label: str) -> str:
+    if not isinstance(value, str):
+        raise TypeError(f"{label} must be text")
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+
+def _utc_instant(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("published_at must be timezone-aware")
+    return value.astimezone(UTC)
 
 
 def _validate_limit(limit: int) -> None:
@@ -123,6 +144,7 @@ def build_card(stored: StoredArticle, max_characters: int = 800) -> ReadingCard:
     _validate_limit(max_characters)
     if not _SAFE_ARTICLE_ID.fullmatch(stored.article.article_id):
         raise ValueError("unsafe article ID")
+    _utc_instant(stored.article.published_at)
 
     source, source_truncated = _read_article_file(
         stored,
@@ -133,7 +155,7 @@ def build_card(stored: StoredArticle, max_characters: int = 800) -> ReadingCard:
         truncate=True,
     )
     if source is None:
-        excerpt = "[Source unavailable: missing]"
+        excerpt = _bounded_excerpt("[Source unavailable: missing]", max_characters)
         retrieval_status = f"{stored.status.value}; source-missing"
     else:
         excerpt = _bounded_excerpt(source, max_characters)
@@ -142,7 +164,11 @@ def build_card(stored: StoredArticle, max_characters: int = 800) -> ReadingCard:
             retrieval_status += "; source-scan-truncated"
 
     if stored.ocr_path is None:
-        ocr_status = "not-needed"
+        ocr_status = (
+            "incomplete"
+            if stored.status is ArticleStatus.OCR_INCOMPLETE
+            else "not-needed"
+        )
     else:
         ocr, _ = _read_article_file(
             stored,
@@ -153,18 +179,24 @@ def build_card(stored: StoredArticle, max_characters: int = 800) -> ReadingCard:
         )
         if ocr is None:
             ocr_status = "missing"
-        elif "OCR incomplete:" in ocr:
+        elif stored.status is ArticleStatus.OCR_INCOMPLETE or "OCR incomplete:" in ocr:
             ocr_status = "incomplete"
         else:
             ocr_status = "available"
 
     return ReadingCard(
         article_id=stored.article.article_id,
-        title=stored.article.title,
-        account_name=stored.article.account_name,
+        title=_bounded_field(stored.article.title, _MAX_TITLE_CHARACTERS, "title"),
+        account_name=_bounded_field(
+            stored.article.account_name, _MAX_ACCOUNT_CHARACTERS, "account name"
+        ),
         published_at=stored.article.published_at,
-        source_url=stored.article.source_url,
-        source_path=stored.source_path,
+        source_url=_bounded_field(
+            stored.article.source_url, _MAX_URL_CHARACTERS, "source URL"
+        ),
+        source_path=Path(
+            _bounded_field(os.fspath(stored.source_path), _MAX_PATH_CHARACTERS, "source path")
+        ),
         excerpt=excerpt,
         meaningful_image_count=len(stored.asset_paths),
         ocr_status=ocr_status,
@@ -176,33 +208,63 @@ def _markdown_value(value: object) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def _render_card(card: ReadingCard) -> bytes:
+    title = _bounded_field(card.title, _MAX_TITLE_CHARACTERS, "title")
+    account = _bounded_field(
+        card.account_name, _MAX_ACCOUNT_CHARACTERS, "account name"
+    )
+    source_url = _bounded_field(card.source_url, _MAX_URL_CHARACTERS, "source URL")
+    source_path = _bounded_field(
+        os.fspath(card.source_path), _MAX_PATH_CHARACTERS, "source path"
+    )
+    excerpt = _bounded_excerpt(
+        _bounded_field(card.excerpt, _MAX_CARD_CHARACTERS, "excerpt"),
+        _MAX_CARD_CHARACTERS,
+    )
+    ocr_status = _bounded_field(
+        card.ocr_status, _MAX_STATUS_CHARACTERS, "OCR status"
+    )
+    retrieval_status = _bounded_field(
+        card.retrieval_status, _MAX_STATUS_CHARACTERS, "retrieval status"
+    )
+    block = "\n".join(
+        [
+            f"## {card.article_id}",
+            "",
+            f"- Title: {_markdown_value(title)}",
+            f"- Account: {_markdown_value(account)}",
+            f"- Published: {_markdown_value(card.published_at.isoformat())}",
+            f"- Source URL: {_markdown_value(source_url)}",
+            f"- Source path: {_markdown_value(source_path)}",
+            f"- Meaningful images: {card.meaningful_image_count}",
+            f"- OCR: {_markdown_value(ocr_status)}",
+            f"- Retrieval: {_markdown_value(retrieval_status)}",
+            "",
+            f"> {excerpt}",
+            "",
+            "",
+        ]
+    ).encode("utf-8")
+    if len(block) > _MAX_SERIALIZED_CARD_BYTES:
+        raise ValueError(f"reading card is too large: {card.article_id}")
+    return block
+
+
 def write_cards(cards: tuple[ReadingCard, ...], path: Path) -> Path:
+    if len(cards) > _MAX_CARDS:
+        raise ValueError(f"too many reading cards; maximum is {_MAX_CARDS}")
     article_ids = [card.article_id for card in cards]
     if len(set(article_ids)) != len(article_ids):
         raise ValueError("duplicate reading card article ID")
     if any(not _SAFE_ARTICLE_ID.fullmatch(article_id) for article_id in article_ids):
         raise ValueError("unsafe article ID")
 
-    lines = ["# ShelfSignal reading cards", ""]
-    for card in sorted(
-        cards, key=lambda item: (item.published_at.isoformat(), item.article_id)
-    ):
-        lines.extend(
-            [
-                f"## {card.article_id}",
-                "",
-                f"- Title: {_markdown_value(card.title)}",
-                f"- Account: {_markdown_value(card.account_name)}",
-                f"- Published: {_markdown_value(card.published_at.isoformat())}",
-                f"- Source URL: {_markdown_value(card.source_url)}",
-                f"- Source path: {_markdown_value(card.source_path)}",
-                f"- Meaningful images: {card.meaningful_image_count}",
-                f"- OCR: {_markdown_value(card.ocr_status)}",
-                f"- Retrieval: {_markdown_value(card.retrieval_status)}",
-                "",
-                f"> {card.excerpt}",
-                "",
-            ]
-        )
-    atomic_write(path, ("\n".join(lines).rstrip() + "\n").encode("utf-8"))
+    ordered = sorted(cards, key=lambda item: (_utc_instant(item.published_at), item.article_id))
+    content = bytearray(b"# ShelfSignal reading cards\n\n")
+    for card in ordered:
+        content.extend(_render_card(card))
+        if len(content) > _MAX_ARTIFACT_BYTES:
+            raise ValueError("reading cards artifact is too large")
+    content = bytearray(bytes(content).rstrip() + b"\n")
+    atomic_write(path, bytes(content))
     return path

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import time
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -187,15 +189,10 @@ def test_ensure_helper_compiles_once_and_rejects_symlink_cache(
     assert first == second
     assert calls == 1
     assert first.stat().st_mode & 0o111
-    marker = build_dir / "shelfsignal-vision-ocr.sha256"
-    original_marker = marker.read_text(encoding="utf-8")
-    assert len(original_marker.strip()) == 64
-
-    marker.write_text("0" * 64 + "\n", encoding="utf-8")
-    third = ensure_helper(build_dir)
-    assert third == first
-    assert calls == 2
-    assert marker.read_text(encoding="utf-8") == original_marker
+    source = Path("src/shelfsignal/resources/vision_ocr.swift")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert first.name == f"shelfsignal-vision-ocr-{digest}"
+    assert not list(build_dir.glob("*.sha256"))
 
     first.unlink()
     outside = tmp_path / "outside"
@@ -203,6 +200,42 @@ def test_ensure_helper_compiles_once_and_rejects_symlink_cache(
     first.symlink_to(outside)
     with pytest.raises(ValueError, match="unsafe OCR helper"):
         ensure_helper(build_dir)
+
+
+def test_helper_source_versions_use_distinct_structural_cache_keys(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    build_dir = tmp_path / "build"
+    source_path = tmp_path / "vision.swift"
+    source_path.write_text("fictional source", encoding="utf-8")
+    payload = [b"source-version-a"]
+    calls = 0
+
+    class Resource:
+        def joinpath(self, name: str) -> Resource:
+            return self
+
+        def read_bytes(self) -> bytes:
+            return payload[0]
+
+    def fake_compile(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal calls
+        calls += 1
+        Path(command[command.index("-o") + 1]).write_bytes(b"fictional-binary")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    resource = Resource()
+    monkeypatch.setattr("shelfsignal.ocr.files", lambda package: resource)
+    monkeypatch.setattr("shelfsignal.ocr.as_file", lambda value: nullcontext(source_path))
+    monkeypatch.setattr("shelfsignal.ocr.subprocess.run", fake_compile)
+
+    first = ensure_helper(build_dir)
+    payload[0] = b"source-version-b"
+    second = ensure_helper(build_dir)
+
+    assert first != second
+    assert first.exists() and second.exists()
+    assert calls == 2
 
 
 def test_ocr_cache_prevents_second_runner_call(tmp_path: Path):
@@ -221,6 +254,35 @@ def test_ocr_cache_prevents_second_runner_call(tmp_path: Path):
     first = ocr_article(article_dir, evidence, 10, tmp_path / "cache", runner)
     assert first is not None
     first_text = first.read_text(encoding="utf-8")
+    second = ocr_article(article_dir, evidence, 10, tmp_path / "cache", runner)
+    assert second is not None
+    assert second.read_text(encoding="utf-8") == first_text
+    assert calls == 1
+
+
+def test_ocr_cache_is_idempotent_at_exact_per_image_byte_limit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setattr("shelfsignal.ocr._MAX_IMAGE_OCR_BYTES", 16)
+    monkeypatch.setattr("shelfsignal.ocr._MAX_ARTICLE_OCR_BYTES", 16)
+    article_dir = tmp_path / "article"
+    article_dir.mkdir()
+    image = tmp_path / "long.jpg"
+    image.write_bytes(b"fictional-image")
+    calls = 0
+
+    def runner(path: Path) -> str:
+        nonlocal calls
+        calls += 1
+        return "x" * 16
+
+    evidence = (ImageEvidence(image, 1200, 8000),)
+    first = ocr_article(article_dir, evidence, 10, tmp_path / "cache", runner)
+    assert first is not None
+    first_text = first.read_text(encoding="utf-8")
+    cache = next((tmp_path / "cache").glob("*.txt"))
+    assert cache.stat().st_size == 16
+
     second = ocr_article(article_dir, evidence, 10, tmp_path / "cache", runner)
     assert second is not None
     assert second.read_text(encoding="utf-8") == first_text
