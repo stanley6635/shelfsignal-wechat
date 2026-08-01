@@ -253,6 +253,41 @@ def test_export_rejects_unsafe_autolinks_and_raw_html(
         export_selected(("selected-1",), library, tmp_path / "exports" / "bundle")
 
 
+@pytest.mark.parametrize(
+    "markup",
+    [
+        '<iframe\nsrc="data:text/html,payload">',
+        '<script\nsrc="https://example.invalid/payload.js"',
+        '<div\nclass="payload"',
+        "<!DOCTYPE html",
+        '<?xml version="1.0"',
+        "<![CDATA[payload",
+    ],
+)
+def test_export_rejects_split_or_incomplete_raw_html_block_openers(
+    tmp_path: Path, markup: str
+):
+    library = tmp_path / "library"
+    article = make_article(library, "selected-1")
+    replace_source(article, f"# selected-1\n\n  {markup}\n")
+
+    with pytest.raises(ExportError, match="raw HTML"):
+        export_selected(("selected-1",), library, tmp_path / "exports" / "bundle")
+
+
+def test_export_preserves_line_start_https_autolink_and_ordinary_comparison(
+    tmp_path: Path,
+):
+    library = tmp_path / "library"
+    article = make_article(library, "selected-1")
+    replace_source(
+        article,
+        "# selected-1\n\n  <https://example.invalid/safe>\n\nA < B\n",
+    )
+
+    export_selected(("selected-1",), library, tmp_path / "exports" / "bundle")
+
+
 def test_export_accepts_suffixless_collector_asset_when_magic_is_raster(tmp_path: Path):
     library = tmp_path / "library"
     article = make_article(library, "selected-1")

@@ -21,6 +21,7 @@ _MARKDOWN_LINK = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]+)\)")
 _MARKDOWN_REFERENCE = re.compile(r"(?m)^\s{0,3}\[[^\]\n]+\]:\s*(\S+)")
 _MARKDOWN_AUTOLINK = re.compile(r"<([A-Za-z][A-Za-z0-9+.-]{1,31}:[^<>\s]*)>")
 _RAW_HTML_TAG = re.compile(r"</?[A-Za-z][^>\n]*>")
+_RAW_HTML_BLOCK_OPENER = re.compile(r"(?m)^[ \t]{0,3}<(?:/?[A-Za-z]|!|\?)")
 _RASTER_SUFFIXES = {
     ".avif",
     ".bmp",
@@ -311,7 +312,9 @@ def _validate_markdown_links(plan: dict[PurePosixPath, bytes]) -> None:
             raise ExportError(f"{markdown_path} must be UTF-8 Markdown") from exc
         autolinks = list(_MARKDOWN_AUTOLINK.finditer(markdown))
         without_autolinks = _MARKDOWN_AUTOLINK.sub("", markdown)
-        if _RAW_HTML_TAG.search(without_autolinks):
+        if _RAW_HTML_TAG.search(without_autolinks) or _RAW_HTML_BLOCK_OPENER.search(
+            without_autolinks
+        ):
             raise ExportError(f"raw HTML is not allowed in {markdown_path}")
         matches = [
             *_MARKDOWN_LINK.finditer(markdown),
