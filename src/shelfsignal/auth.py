@@ -102,34 +102,41 @@ def _open_filesystem_anchor(anchor: str) -> int:
         raise ValueError("filesystem anchor is unavailable") from exc
     try:
         is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
-    except OSError as exc:
-        try:
-            os.close(descriptor)
-        except OSError as close_exc:
-            exc.add_note(f"filesystem anchor descriptor also failed to close: {close_exc}")
-        raise ValueError("filesystem anchor could not be inspected") from exc
+    except BaseException as exc:
+        _close_opened_descriptor(descriptor, exc)
+        raise
     if not is_directory:
-        os.close(descriptor)
-        raise ValueError("filesystem anchor is not a directory")
+        error = ValueError("filesystem anchor is not a directory")
+        _close_opened_descriptor(descriptor, error)
+        raise error
     return descriptor
+
+
+def _close_opened_descriptor(descriptor: int, primary_error: BaseException) -> None:
+    try:
+        os.close(descriptor)
+    except BaseException as close_error:  # noqa: BLE001 - ownership boundary
+        primary_error.add_note(f"descriptor cleanup also failed: {close_error}")
 
 
 def _close_descriptors(
     descriptors: list[int], primary_error: BaseException | None
 ) -> None:
-    close_error: OSError | None = None
+    close_error: BaseException | None = None
     for descriptor in reversed(descriptors):
         try:
             os.close(descriptor)
-        except OSError as exc:
+        except BaseException as exc:  # noqa: BLE001 - every owned fd must be attempted
             if close_error is None:
                 close_error = exc
+            else:
+                close_error.add_note(f"another descriptor also failed to close: {exc}")
     if close_error is None:
         return
     if primary_error is not None:
         primary_error.add_note(f"browser profile descriptor cleanup also failed: {close_error}")
     else:
-        raise ValueError("browser profile descriptors could not be closed") from close_error
+        raise close_error
 
 
 def _open_existing_ancestor_at(parent_fd: int, name: str, display_path: Path) -> int:
@@ -143,8 +150,8 @@ def _open_existing_ancestor_at(parent_fd: int, name: str, display_path: Path) ->
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ValueError(f"browser root ancestor is not a directory: {display_path}")
         _verify_opened_directory(parent_fd, name, descriptor, display_path)
-    except Exception:
-        os.close(descriptor)
+    except BaseException as exc:
+        _close_opened_descriptor(descriptor, exc)
         raise
     return descriptor
 
@@ -164,8 +171,8 @@ def _open_private_directory_at(parent_fd: int, name: str, display_path: Path) ->
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
             raise ValueError(f"browser profile path is not a directory: {display_path}")
         os.fchmod(descriptor, 0o700)
-    except Exception:
-        os.close(descriptor)
+    except BaseException as exc:
+        _close_opened_descriptor(descriptor, exc)
         raise
     return descriptor
 
@@ -234,6 +241,29 @@ def _handle_cleanup_failure(
         raise cleanup_error
 
 
+async def _stop_playwright_manager(manager, primary_error: BaseException | None) -> None:
+    try:
+        await manager.__aexit__(
+            type(primary_error) if primary_error is not None else None,
+            primary_error,
+            primary_error.__traceback__ if primary_error is not None else None,
+        )
+    except asyncio.CancelledError as exit_error:
+        _handle_cleanup_failure(
+            primary_error,
+            exit_error,
+            note="Playwright manager also failed to stop",
+            standalone_message="Playwright manager could not be stopped",
+        )
+    except Exception as exit_error:  # noqa: BLE001 - cleanup must preserve primary errors
+        _handle_cleanup_failure(
+            primary_error,
+            exit_error,
+            note="Playwright manager also failed to stop",
+            standalone_message="Playwright manager could not be stopped",
+        )
+
+
 @asynccontextmanager
 async def authenticated_context(
     browser_root: Path,
@@ -244,8 +274,12 @@ async def authenticated_context(
     manager = async_playwright()
     try:
         playwright = await manager.__aenter__()
-    except PlaywrightError as exc:
-        raise ShelfUnavailable("Playwright manager could not be started") from exc
+    except BaseException as enter_error:
+        if hasattr(manager, "_connection"):
+            await _stop_playwright_manager(manager, enter_error)
+        if isinstance(enter_error, PlaywrightError):
+            raise ShelfUnavailable("Playwright manager could not be started") from enter_error
+        raise
 
     manager_primary_error: BaseException | None = None
     try:
@@ -307,25 +341,4 @@ async def authenticated_context(
         manager_primary_error = exc
         raise
     finally:
-        try:
-            await manager.__aexit__(
-                type(manager_primary_error) if manager_primary_error is not None else None,
-                manager_primary_error,
-                manager_primary_error.__traceback__
-                if manager_primary_error is not None
-                else None,
-            )
-        except asyncio.CancelledError as exit_exc:
-            _handle_cleanup_failure(
-                manager_primary_error,
-                exit_exc,
-                note="Playwright manager also failed to stop",
-                standalone_message="Playwright manager could not be stopped",
-            )
-        except Exception as exit_exc:  # noqa: BLE001 - cleanup must preserve primary errors
-            _handle_cleanup_failure(
-                manager_primary_error,
-                exit_exc,
-                note="Playwright manager also failed to stop",
-                standalone_message="Playwright manager could not be stopped",
-            )
+        await _stop_playwright_manager(manager, manager_primary_error)

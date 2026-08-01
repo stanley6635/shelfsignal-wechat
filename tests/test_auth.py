@@ -20,10 +20,14 @@ from shelfsignal.errors import AuthRequired, ShelfUnavailable
 class FakePlaywrightManager:
     def __init__(self, playwright):
         self.playwright = playwright
+        self.enter = AsyncMock(return_value=playwright)
         self.exit = AsyncMock(return_value=False)
+        self.create_connection_on_enter = True
 
     async def __aenter__(self):
-        return self.playwright
+        if self.create_connection_on_enter:
+            self._connection = object()
+        return await self.enter()
 
     async def __aexit__(self, exc_type, exc, traceback):
         return await self.exit(exc_type, exc, traceback)
@@ -484,3 +488,136 @@ async def test_manager_exit_failure_does_not_mask_primary_cancellation(
     with pytest.raises(asyncio.CancelledError):
         async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
             raise asyncio.CancelledError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("enter_error", "expected_error"),
+    [
+        (asyncio.CancelledError(), asyncio.CancelledError),
+        (auth_module.PlaywrightError("enter failed"), ShelfUnavailable),
+        (RuntimeError("generic enter failed"), RuntimeError),
+    ],
+)
+async def test_partial_manager_enter_is_cleaned_without_masking_primary(
+    tmp_path, monkeypatch, enter_error, expected_error
+):
+    page = SimpleNamespace(url=auth_module.SHELF_URL)
+    context, _ = install_mock_playwright(monkeypatch, page)
+    manager = context.playwright_manager
+    manager.enter.side_effect = enter_error
+    manager.exit.side_effect = auth_module.PlaywrightError("partial cleanup failed")
+
+    with pytest.raises(expected_error) as captured:
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+    manager.exit.assert_awaited_once()
+    primary = captured.value.__cause__ or captured.value
+    assert any("partial cleanup failed" in note for note in primary.__notes__)
+
+
+@pytest.mark.asyncio
+async def test_manager_enter_failure_before_connection_does_not_call_exit(
+    tmp_path, monkeypatch
+):
+    page = SimpleNamespace(url=auth_module.SHELF_URL)
+    context, _ = install_mock_playwright(monkeypatch, page)
+    manager = context.playwright_manager
+    manager.create_connection_on_enter = False
+    manager.enter.side_effect = RuntimeError("failed before connection")
+
+    with pytest.raises(RuntimeError, match="failed before connection"):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+    manager.exit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure_type"),
+    [
+        ("anchor", KeyboardInterrupt),
+        ("anchor", SystemExit),
+        ("ancestor", KeyboardInterrupt),
+        ("ancestor", SystemExit),
+        ("private", KeyboardInterrupt),
+        ("private", SystemExit),
+    ],
+)
+def test_post_open_baseexception_closes_every_owned_descriptor(
+    tmp_path: Path, monkeypatch, stage: str, failure_type: type[BaseException]
+):
+    opened: list[int] = []
+    closed: list[int] = []
+    original_open = auth_module.os.open
+    original_close = auth_module.os.close
+    original_fstat = auth_module.os.fstat
+    original_fchmod = auth_module.os.fchmod
+    fstat_calls = 0
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def tracking_close(descriptor):
+        closed.append(descriptor)
+        return original_close(descriptor)
+
+    def injected_fstat(descriptor):
+        nonlocal fstat_calls
+        fstat_calls += 1
+        if stage == "anchor" and fstat_calls == 1:
+            raise failure_type("anchor inspection interrupted")
+        if stage == "ancestor" and fstat_calls == 2:
+            raise failure_type("ancestor inspection interrupted")
+        return original_fstat(descriptor)
+
+    def injected_fchmod(descriptor, mode):
+        if stage == "private":
+            raise failure_type("private inspection interrupted")
+        return original_fchmod(descriptor, mode)
+
+    monkeypatch.setattr(auth_module.os, "open", tracking_open)
+    monkeypatch.setattr(auth_module.os, "close", tracking_close)
+    monkeypatch.setattr(auth_module.os, "fstat", injected_fstat)
+    monkeypatch.setattr(auth_module.os, "fchmod", injected_fchmod)
+
+    with pytest.raises(failure_type):
+        prepare_profile(tmp_path / "browser", "run-001", AuthPolicy.FRESH)
+
+    assert opened
+    assert set(opened) <= set(closed)
+
+
+@pytest.mark.parametrize("failure_type", [KeyboardInterrupt, SystemExit])
+def test_descriptor_list_cleanup_continues_after_baseexception(
+    tmp_path: Path, monkeypatch, failure_type: type[BaseException]
+):
+    opened: list[int] = []
+    closed: list[int] = []
+    original_open = auth_module.os.open
+    original_close = auth_module.os.close
+    injected = False
+
+    def tracking_open(path, flags, mode=0o777, *, dir_fd=None):
+        descriptor = original_open(path, flags, mode, dir_fd=dir_fd)
+        opened.append(descriptor)
+        return descriptor
+
+    def close_then_interrupt_once(descriptor):
+        nonlocal injected
+        closed.append(descriptor)
+        original_close(descriptor)
+        if not injected:
+            injected = True
+            raise failure_type("descriptor cleanup interrupted")
+
+    monkeypatch.setattr(auth_module.os, "open", tracking_open)
+    monkeypatch.setattr(auth_module.os, "close", close_then_interrupt_once)
+
+    with pytest.raises(failure_type):
+        prepare_profile(tmp_path / "browser", "run-001", AuthPolicy.FRESH)
+
+    assert set(opened) <= set(closed)
