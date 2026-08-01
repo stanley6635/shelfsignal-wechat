@@ -20,12 +20,13 @@ from shelfsignal.errors import AuthRequired, ShelfUnavailable
 class FakePlaywrightManager:
     def __init__(self, playwright):
         self.playwright = playwright
+        self.exit = AsyncMock(return_value=False)
 
     async def __aenter__(self):
         return self.playwright
 
     async def __aexit__(self, exc_type, exc, traceback):
-        return False
+        return await self.exit(exc_type, exc, traceback)
 
 
 def install_mock_playwright(monkeypatch, page):
@@ -36,10 +37,12 @@ def install_mock_playwright(monkeypatch, page):
     )
     launch = AsyncMock(return_value=context)
     playwright = SimpleNamespace(chromium=SimpleNamespace(launch_persistent_context=launch))
+    manager = FakePlaywrightManager(playwright)
+    context.playwright_manager = manager
     monkeypatch.setattr(
         auth_module,
         "async_playwright",
-        lambda: FakePlaywrightManager(playwright),
+        lambda: manager,
     )
     return context, launch
 
@@ -82,6 +85,50 @@ def test_prepare_profile_rejects_relative_or_parent_ambiguous_browser_root(
         prepare_profile(base / "child" / "..", "run-001", AuthPolicy.FRESH)
 
     assert not base.exists()
+
+
+def test_prepare_profile_rejects_missing_ancestor_without_creating_it(tmp_path: Path):
+    missing = tmp_path / "missing"
+
+    with pytest.raises(ValueError, match="ancestor"):
+        prepare_profile(missing / "browser", "run-001", AuthPolicy.FRESH)
+
+    assert not missing.exists()
+
+
+def test_prepare_profile_creates_only_browser_leaf_and_preserves_ancestor_mode(
+    tmp_path: Path,
+):
+    parent = tmp_path / "existing-parent"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+
+    profile = prepare_profile(parent / "browser", "run-001", AuthPolicy.FRESH)
+
+    assert profile.is_dir()
+    assert stat.S_IMODE(parent.stat().st_mode) == 0o755
+    assert stat.S_IMODE((parent / "browser").stat().st_mode) == 0o700
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_prepare_profile_rejects_symlink_at_any_ancestor_depth(tmp_path: Path, depth: int):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    if depth == 1:
+        linked = tmp_path / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+        browser_root = linked / "browser"
+    else:
+        container = tmp_path / "container"
+        container.mkdir()
+        linked = container / "linked"
+        linked.symlink_to(outside, target_is_directory=True)
+        browser_root = linked / "nested" / "browser"
+
+    with pytest.raises(ValueError, match="ancestor"):
+        prepare_profile(browser_root, "run-001", AuthPolicy.FRESH)
+
+    assert list(outside.iterdir()) == []
 
 
 @pytest.mark.parametrize("run_id", ["../escape", "/tmp/escape", "nested/run", ".", "run 001"])
@@ -355,12 +402,16 @@ async def test_close_failure_does_not_mask_primary_body_failure(tmp_path, monkey
     )
     context, _ = install_mock_playwright(monkeypatch, page)
     context.close.side_effect = auth_module.PlaywrightError("close failed")
+    context.playwright_manager.exit.side_effect = auth_module.PlaywrightError(
+        "manager exit failed"
+    )
 
     with pytest.raises(RuntimeError, match="primary failure") as captured:
         async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
             raise RuntimeError("primary failure")
 
     assert any("close failed" in note for note in captured.value.__notes__)
+    assert any("manager exit failed" in note for note in captured.value.__notes__)
 
 
 @pytest.mark.asyncio
@@ -393,3 +444,43 @@ async def test_cancellation_during_close_is_not_reclassified(tmp_path, monkeypat
     with pytest.raises(asyncio.CancelledError):
         async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
             pass
+
+
+@pytest.mark.asyncio
+async def test_manager_exit_failure_after_success_is_named_shelf_failure(
+    tmp_path, monkeypatch
+):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.playwright_manager.exit.side_effect = auth_module.PlaywrightError(
+        "manager exit failed"
+    )
+
+    with pytest.raises(ShelfUnavailable, match="Playwright manager could not be stopped"):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_manager_exit_failure_does_not_mask_primary_cancellation(
+    tmp_path, monkeypatch
+):
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(return_value=SimpleNamespace(status=200)),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+    context.playwright_manager.exit.side_effect = auth_module.PlaywrightError(
+        "manager exit failed"
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with authenticated_context(tmp_path / "browser", "run-001", AuthPolicy.REUSE):
+            raise asyncio.CancelledError

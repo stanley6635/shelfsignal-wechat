@@ -42,20 +42,37 @@ def prepare_profile(browser_root: Path, run_id: str, policy: AuthPolicy | str) -
         raise ValueError("browser profile escapes the browser root")
 
     descriptors: list[int] = []
-    root_fd = _open_private_root(browser_root)
-    descriptors.append(root_fd)
-    parent_fd = root_fd
+    anchor_fd = _open_filesystem_anchor(browser_root.anchor)
+    descriptors.append(anchor_fd)
+    parent_fd = anchor_fd
+    primary_error: BaseException | None = None
     try:
+        current_path = Path(browser_root.anchor)
+        for name in browser_root.parent.parts[1:]:
+            current_path /= name
+            descriptor = _open_existing_ancestor_at(parent_fd, name, current_path)
+            descriptors.append(descriptor)
+            parent_fd = descriptor
+
+        root_fd = _open_private_directory_at(
+            parent_fd, browser_root.name, browser_root
+        )
+        descriptors.append(root_fd)
+        _verify_opened_directory(
+            parent_fd, browser_root.name, root_fd, browser_root
+        )
+        parent_fd = root_fd
         for index, name in enumerate(names):
             display_path = browser_root.joinpath(*names[: index + 1])
             descriptor = _open_private_directory_at(parent_fd, name, display_path)
             descriptors.append(descriptor)
             _verify_opened_directory(parent_fd, name, descriptor, display_path)
             parent_fd = descriptor
-        _verify_root_identity(browser_root, root_fd)
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        for descriptor in reversed(descriptors):
-            os.close(descriptor)
+        _close_descriptors(descriptors, primary_error)
     return profile
 
 
@@ -74,20 +91,58 @@ def _safe_absolute_browser_root(path: Path) -> Path:
     return normalized
 
 
-def _open_private_root(path: Path) -> int:
+def _directory_open_flags() -> int:
+    return os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+
+
+def _open_filesystem_anchor(anchor: str) -> int:
     try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        descriptor = os.open(anchor, _directory_open_flags())
     except OSError as exc:
-        raise ValueError(f"browser profile directory is unsafe: {path}") from exc
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        raise ValueError("filesystem anchor is unavailable") from exc
     try:
-        descriptor = os.open(path, flags)
+        is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
     except OSError as exc:
-        raise ValueError(f"browser profile directory is unsafe: {path}") from exc
+        try:
+            os.close(descriptor)
+        except OSError as close_exc:
+            exc.add_note(f"filesystem anchor descriptor also failed to close: {close_exc}")
+        raise ValueError("filesystem anchor could not be inspected") from exc
+    if not is_directory:
+        os.close(descriptor)
+        raise ValueError("filesystem anchor is not a directory")
+    return descriptor
+
+
+def _close_descriptors(
+    descriptors: list[int], primary_error: BaseException | None
+) -> None:
+    close_error: OSError | None = None
+    for descriptor in reversed(descriptors):
+        try:
+            os.close(descriptor)
+        except OSError as exc:
+            if close_error is None:
+                close_error = exc
+    if close_error is None:
+        return
+    if primary_error is not None:
+        primary_error.add_note(f"browser profile descriptor cleanup also failed: {close_error}")
+    else:
+        raise ValueError("browser profile descriptors could not be closed") from close_error
+
+
+def _open_existing_ancestor_at(parent_fd: int, name: str, display_path: Path) -> int:
+    try:
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+    except OSError as exc:
+        raise ValueError(
+            f"browser root ancestor is unsafe or missing: {display_path}"
+        ) from exc
     try:
         if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
-            raise ValueError(f"browser profile path is not a directory: {path}")
-        os.fchmod(descriptor, 0o700)
+            raise ValueError(f"browser root ancestor is not a directory: {display_path}")
+        _verify_opened_directory(parent_fd, name, descriptor, display_path)
     except Exception:
         os.close(descriptor)
         raise
@@ -101,9 +156,8 @@ def _open_private_directory_at(parent_fd: int, name: str, display_path: Path) ->
         pass
     except OSError as exc:
         raise ValueError(f"browser profile directory is unsafe: {display_path}") from exc
-    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
-        descriptor = os.open(name, flags, dir_fd=parent_fd)
+        descriptor = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
     except OSError as exc:
         raise ValueError(f"browser profile directory is unsafe: {display_path}") from exc
     try:
@@ -129,19 +183,6 @@ def _verify_opened_directory(
         or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
     ):
         raise ValueError(f"browser profile directory is unsafe: {display_path}")
-
-
-def _verify_root_identity(path: Path, descriptor: int) -> None:
-    try:
-        current = os.stat(path, follow_symlinks=False)
-        opened = os.fstat(descriptor)
-    except OSError as exc:
-        raise ValueError(f"browser profile path changed during setup: {path}") from exc
-    if (
-        not stat.S_ISDIR(current.st_mode)
-        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
-    ):
-        raise ValueError(f"browser profile directory is unsafe: {path}")
 
 
 def is_auth_required(url: str, status: int) -> bool:
@@ -178,6 +219,21 @@ async def _probe_shelf(page):
     return page.url, response.status
 
 
+def _handle_cleanup_failure(
+    primary_error: BaseException | None,
+    cleanup_error: BaseException,
+    *,
+    note: str,
+    standalone_message: str,
+) -> None:
+    if primary_error is not None:
+        primary_error.add_note(f"{note}: {cleanup_error}")
+    elif isinstance(cleanup_error, Exception):
+        raise ShelfUnavailable(standalone_message) from cleanup_error
+    else:
+        raise cleanup_error
+
+
 @asynccontextmanager
 async def authenticated_context(
     browser_root: Path,
@@ -185,12 +241,23 @@ async def authenticated_context(
     policy: AuthPolicy,
 ) -> AsyncIterator[BrowserContext]:
     profile = prepare_profile(browser_root, run_id, policy)
-    async with async_playwright() as playwright:
-        context = await playwright.chromium.launch_persistent_context(
-            user_data_dir=profile,
-            headless=False,
-        )
-        primary_error: BaseException | None = None
+    manager = async_playwright()
+    try:
+        playwright = await manager.__aenter__()
+    except PlaywrightError as exc:
+        raise ShelfUnavailable("Playwright manager could not be started") from exc
+
+    manager_primary_error: BaseException | None = None
+    try:
+        try:
+            context = await playwright.chromium.launch_persistent_context(
+                user_data_dir=profile,
+                headless=False,
+            )
+        except PlaywrightError as exc:
+            raise ShelfUnavailable("WeRead browser context could not be started") from exc
+
+        context_primary_error: BaseException | None = None
         try:
             page = context.pages[0] if context.pages else await context.new_page()
             url, status = await _probe_shelf(page)
@@ -217,19 +284,48 @@ async def authenticated_context(
             classify_shelf_probe(status)
             yield context
         except BaseException as exc:
-            primary_error = exc
+            context_primary_error = exc
             raise
         finally:
             try:
                 await context.close()
-            except BaseException as close_exc:
-                if primary_error is not None:
-                    primary_error.add_note(
-                        f"WeRead browser context also failed to close: {close_exc}"
-                    )
-                elif isinstance(close_exc, Exception):
-                    raise ShelfUnavailable(
-                        "WeRead browser context could not be closed"
-                    ) from close_exc
-                else:
-                    raise
+            except asyncio.CancelledError as close_exc:
+                _handle_cleanup_failure(
+                    context_primary_error,
+                    close_exc,
+                    note="WeRead browser context also failed to close",
+                    standalone_message="WeRead browser context could not be closed",
+                )
+            except Exception as close_exc:  # noqa: BLE001 - cleanup must preserve primary errors
+                _handle_cleanup_failure(
+                    context_primary_error,
+                    close_exc,
+                    note="WeRead browser context also failed to close",
+                    standalone_message="WeRead browser context could not be closed",
+                )
+    except BaseException as exc:
+        manager_primary_error = exc
+        raise
+    finally:
+        try:
+            await manager.__aexit__(
+                type(manager_primary_error) if manager_primary_error is not None else None,
+                manager_primary_error,
+                manager_primary_error.__traceback__
+                if manager_primary_error is not None
+                else None,
+            )
+        except asyncio.CancelledError as exit_exc:
+            _handle_cleanup_failure(
+                manager_primary_error,
+                exit_exc,
+                note="Playwright manager also failed to stop",
+                standalone_message="Playwright manager could not be stopped",
+            )
+        except Exception as exit_exc:  # noqa: BLE001 - cleanup must preserve primary errors
+            _handle_cleanup_failure(
+                manager_primary_error,
+                exit_exc,
+                note="Playwright manager also failed to stop",
+                standalone_message="Playwright manager could not be stopped",
+            )
