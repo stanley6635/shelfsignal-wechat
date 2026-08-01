@@ -31,6 +31,36 @@ def test_state_round_trip_and_idempotency(tmp_path: Path):
     assert store.is_known_url("https://example.invalid/article")
     store.finish_run("run-001", "complete")
     assert store.run_status("run-001") == "complete"
+    assert store.run_details("run-001") == ("complete", "fresh")
+
+
+def test_resume_run_preserves_original_auth_policy_and_reopens_failed_run(
+    tmp_path: Path,
+) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+    store.start_run("run-001", "fresh")
+    store.finish_run("run-001", "failed")
+
+    with pytest.raises(StateError, match="authentication policy"):
+        store.resume_run("run-001", "reuse")
+    assert store.run_details("run-001") == ("failed", "fresh")
+
+    store.resume_run("run-001", "fresh")
+    assert store.run_details("run-001") == ("running", "fresh")
+
+
+def test_resume_run_rejects_missing_and_complete_runs(tmp_path: Path) -> None:
+    store = StateStore(tmp_path / "state.db")
+    store.initialize()
+
+    with pytest.raises(StateError, match="does not exist"):
+        store.resume_run("missing", "fresh")
+
+    store.start_run("run-001", "fresh")
+    store.finish_run("run-001", "complete")
+    with pytest.raises(StateError, match="not eligible"):
+        store.resume_run("run-001", "fresh")
 
 
 def test_initialize_rejects_database_symlink_without_touching_target(tmp_path: Path):

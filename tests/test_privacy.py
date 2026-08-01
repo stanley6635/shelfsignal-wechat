@@ -4,7 +4,7 @@ import logging
 
 import pytest
 
-from shelfsignal.cli import RedactingFilter
+from shelfsignal.cli import RedactingFilter, _install_redacting_filter
 
 
 @pytest.mark.parametrize(
@@ -56,3 +56,18 @@ def test_redacting_filter_does_not_mutate_unrelated_formatted_log(
 
     assert "collected 2 articles" in caplog.text
     assert "[REDACTED]" not in caplog.text
+
+
+def test_installed_redaction_covers_package_children_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install_redacting_filter()
+    package_child = logging.getLogger("shelfsignal.child")
+    unrelated = logging.getLogger("example.unrelated")
+    with caplog.at_level(logging.INFO):
+        package_child.info("Authorization: Bearer %s", "child-secret")
+        unrelated.info("unrelated value=%s", "preserved")
+
+    assert "child-secret" not in caplog.text
+    assert "Authorization: [REDACTED]" in caplog.text
+    assert "unrelated value=preserved" in caplog.text

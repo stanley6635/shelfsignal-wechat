@@ -152,11 +152,36 @@ class StateStore:
             )
 
     def run_status(self, run_id: str) -> str | None:
+        details = self.run_details(run_id)
+        return None if details is None else details[0]
+
+    def run_details(self, run_id: str) -> tuple[str, str] | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+                "SELECT status, auth_policy FROM runs WHERE run_id = ?", (run_id,)
             ).fetchone()
-        return None if row is None else str(row["status"])
+        if row is None:
+            return None
+        return str(row["status"]), str(row["auth_policy"])
+
+    def resume_run(self, run_id: str, auth_policy: str) -> None:
+        """Atomically resume an interrupted run without changing its auth contract."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT status, auth_policy FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError("run does not exist")
+            status = str(row["status"])
+            original_policy = str(row["auth_policy"])
+            if status not in {"running", "failed"}:
+                raise StateError("run is not eligible for resume")
+            if original_policy != auth_policy:
+                raise StateError("run authentication policy does not match its original policy")
+            connection.execute(
+                "UPDATE runs SET finished_at = NULL, status = 'running' WHERE run_id = ?",
+                (run_id,),
+            )
 
     def upsert_article(
         self,

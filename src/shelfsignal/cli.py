@@ -50,19 +50,36 @@ _MAX_SOURCE_PROBE_BYTES = 4096
 _MAX_OCR_BYTES = 8 * 1024 * 1024
 _MAX_OMISSIONS = 2_000
 _MAX_OMISSION_TEXT = 500
+_MAX_BRIEFING_WARNINGS = 200
+_MAX_PUBLIC_ERROR_TEXT = 1_000
+_RESERVED_RUN_IDS = {"historical-seed"}
+_SECRET_HEADER = re.compile(
+    r"(?is)\b(cookie|authorization)\s*:\s*"
+    r"(?:(?!\b(?:cookie|authorization)\s*:|\r?\n).)*"
+)
+
+
+def redact_text(
+    value: object,
+    *,
+    one_line: bool = False,
+    max_characters: int | None = None,
+) -> str:
+    """Return authentication-safe text without changing unrelated content."""
+    redacted = _SECRET_HEADER.sub(r"\1: [REDACTED]", str(value))
+    if one_line:
+        redacted = " ".join(redacted.split())
+    if max_characters is not None:
+        redacted = redacted[:max_characters]
+    return redacted
 
 
 class RedactingFilter(logging.Filter):
     """Redact HTTP authentication headers after logging arguments are formatted."""
 
-    _secret = re.compile(
-        r"(?is)\b(cookie|authorization)\s*:\s*"
-        r"(?:(?!\b(?:cookie|authorization)\s*:|\r?\n).)*"
-    )
-
     def filter(self, record: logging.LogRecord) -> bool:
         rendered = record.getMessage()
-        redacted = self._secret.sub(r"\1: [REDACTED]", rendered)
+        redacted = redact_text(rendered)
         if redacted != rendered:
             record.msg = redacted
             record.args = ()
@@ -70,9 +87,22 @@ class RedactingFilter(logging.Filter):
 
 
 def _install_redacting_filter() -> None:
-    logger = logging.getLogger("shelfsignal")
-    if not any(isinstance(item, RedactingFilter) for item in logger.filters):
-        logger.addFilter(RedactingFilter())
+    current_factory = logging.getLogRecordFactory()
+    if getattr(current_factory, "_shelfsignal_redacting_factory", False):
+        return
+
+    def redacting_factory(*args: object, **kwargs: object) -> logging.LogRecord:
+        record = current_factory(*args, **kwargs)
+        if record.name == "shelfsignal" or record.name.startswith("shelfsignal."):
+            rendered = record.getMessage()
+            redacted = redact_text(rendered)
+            if redacted != rendered:
+                record.msg = redacted
+                record.args = ()
+        return record
+
+    redacting_factory._shelfsignal_redacting_factory = True  # type: ignore[attr-defined]
+    logging.setLogRecordFactory(redacting_factory)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -125,6 +155,13 @@ def _safe_run_id(value: object) -> str:
     if not isinstance(value, str) or _SAFE_RUN_ID.fullmatch(value) is None:
         raise ValueError("run ID must be a safe single path component")
     return value
+
+
+def _usable_run_id(value: object) -> str:
+    run_id = _safe_run_id(value)
+    if run_id in _RESERVED_RUN_IDS:
+        raise ValueError("run ID is reserved for internal state")
+    return run_id
 
 
 def _safe_account_ids(values: Sequence[str]) -> set[str] | None:
@@ -275,6 +312,32 @@ def _briefing_context(paths: WorkspacePaths, briefing: Path) -> tuple[str, Path]
     return run_id, candidate
 
 
+def _ensure_unpublished_run(paths: WorkspacePaths, run_id: str) -> None:
+    ensure_safe_directory(paths.runs_dir / run_id, label="run")
+    ensure_safe_directory(paths.briefings_dir, label="briefing")
+    artifacts = (
+        paths.briefings_dir / f"{run_id}.md",
+        paths.runs_dir / run_id / "manifest.md",
+    )
+    if any(os.path.lexists(path) for path in artifacts):
+        raise StateError("run already has a published briefing or manifest")
+
+
+def _require_preparable_run(store: StateStore, run_id: str) -> tuple[str, str]:
+    details = store.run_details(run_id)
+    if details is None:
+        raise StateError("run does not exist")
+    if details[0] not in {"running", "failed"}:
+        raise StateError("run is not eligible for briefing preparation")
+    return details
+
+
+def _validate_briefing_run_header(markdown: str, run_id: str) -> None:
+    first_line = markdown.split("\n", 1)[0]
+    if first_line != f"# WeChat briefing · {run_id}":
+        raise BriefingError("briefing run header does not match its filename")
+
+
 def doctor_workspace(paths: WorkspacePaths) -> None:
     missing = [name for name in ("swiftc", "sips") if shutil.which(name) is None]
     if missing:
@@ -295,24 +358,33 @@ async def list_accounts_run(
 
 
 def _one_line(value: object) -> str:
-    return " ".join(str(value).split())[:_MAX_OMISSION_TEXT]
+    return redact_text(
+        value, one_line=True, max_characters=_MAX_OMISSION_TEXT
+    ).replace("`", "'")
 
 
 def write_omissions(run_dir: Path, omissions: list[CollectionOmission]) -> Path:
     run_dir = ensure_safe_directory(run_dir, label="run")
     path = run_dir / "omissions.md"
-    lines = ["# Visible partial failures", ""]
+    content = bytearray(b"# Visible partial failures\n\n")
+    included = 0
+    summary_reserve = 128
     for item in omissions[:_MAX_OMISSIONS]:
-        lines.append(
+        line = (
             f"- {_one_line(item.scope)} `{_one_line(item.identifier)}`: "
-            f"{_one_line(item.reason)}"
-        )
-    if len(omissions) > _MAX_OMISSIONS:
-        lines.append(f"- run `omissions`: {len(omissions) - _MAX_OMISSIONS} more omitted")
-    content = ("\n".join(lines).rstrip() + "\n").encode("utf-8")
-    if len(content) > _MAX_OMISSIONS_BYTES:
-        raise ValueError("omissions artifact is too large")
-    atomic_write(path, content)
+            f"{_one_line(item.reason)}\n"
+        ).encode()
+        if len(content) + len(line) + summary_reserve > _MAX_OMISSIONS_BYTES:
+            break
+        content.extend(line)
+        included += 1
+    omitted = len(omissions) - included
+    if omitted:
+        summary = f"- run `omissions`: {omitted} more omitted\n".encode()
+        if len(content) + len(summary) > _MAX_OMISSIONS_BYTES:
+            raise AssertionError("omission summary reserve is insufficient")
+        content.extend(summary)
+    atomic_write(path, bytes(content))
     return path
 
 
@@ -329,20 +401,25 @@ def _existing_warnings(paths: WorkspacePaths, run_dir: Path) -> list[str]:
         if os.path.lexists(omissions_path):
             raise
         return []
-    return [line[2:] for line in text.splitlines() if line.startswith("- ")]
+    warnings = [line[2:] for line in text.splitlines() if line.startswith("- ")]
+    if len(warnings) <= _MAX_BRIEFING_WARNINGS:
+        return warnings
+    visible = warnings[: _MAX_BRIEFING_WARNINGS - 1]
+    visible.append(
+        f"{len(warnings) - len(visible)} more collection warnings; see omissions.md"
+    )
+    return visible
 
 
 def prepare_run(paths: WorkspacePaths, store: StateStore, run_id: str) -> Path:
-    run_id = _safe_run_id(run_id)
+    run_id = _usable_run_id(run_id)
     run_dir = ensure_safe_directory(paths.runs_dir / run_id, label="run")
     warnings = _existing_warnings(paths, run_dir)
-    cards = []
-    for article_id in store.article_ids_for_run(run_id):
-        try:
-            cards.append(build_card(load_stored_article(paths.library_dir / article_id)))
-        except Exception as exc:  # noqa: BLE001 - corrupt articles remain visible as omissions
-            warnings.append(f"article `{article_id}`: {type(exc).__name__}")
-    card_tuple = tuple(cards)
+    stored = tuple(
+        load_stored_article(paths.library_dir / article_id)
+        for article_id in store.article_ids_for_run(run_id)
+    )
+    card_tuple = tuple(build_card(item) for item in stored)
     write_cards(card_tuple, run_dir / "cards.md")
     shell = create_briefing_shell(run_id, card_tuple, tuple(warnings))
     bindings = initial_run_bindings(shell)
@@ -363,7 +440,10 @@ async def process_client_run(
     ocr_runner: Callable[[Path], str] | None = None,
     account_ids: set[str] | None = None,
 ) -> Path:
-    run_id = _safe_run_id(run_id)
+    run_id = _usable_run_id(run_id)
+    details = store.run_details(run_id)
+    if details is None or details[0] != "running":
+        raise StateError("article processing requires a running run")
     ensure_safe_directory(paths.runs_dir / run_id, label="run")
 
     def checkpoint(item: StoredArticle) -> None:
@@ -424,13 +504,23 @@ async def collect_run(
     run_id: str,
     account_ids: set[str] | None = None,
 ) -> Path:
-    run_id = _safe_run_id(run_id)
+    run_id = _usable_run_id(run_id)
     if type(lookback_days) is not int or not 0 <= lookback_days <= MAX_LOOKBACK_DAYS:
         raise ValueError(f"lookback days must be between 0 and {MAX_LOOKBACK_DAYS}")
     store = StateStore(paths.state_db)
     store.initialize()
-    if store.run_status(run_id) is None:
+    details = store.run_details(run_id)
+    if details is None:
+        _ensure_unpublished_run(paths, run_id)
         store.start_run(run_id, auth_policy.value)
+    else:
+        status, original_policy = details
+        if status not in {"running", "failed"}:
+            raise StateError("run is not eligible for resume")
+        if original_policy != auth_policy.value:
+            raise StateError("run authentication policy does not match its original policy")
+        _ensure_unpublished_run(paths, run_id)
+        store.resume_run(run_id, auth_policy.value)
     try:
         async with authenticated_context(paths.browser_dir, run_id, auth_policy) as context:
             page = context.pages[0] if context.pages else await context.new_page()
@@ -469,7 +559,7 @@ def dispatch(args: argparse.Namespace) -> int:
         print(f"workspace={paths.root} state=ok")
         return 0
     if args.command == "list-accounts":
-        run_id = _safe_run_id(args.run_id or new_run_id())
+        run_id = _usable_run_id(args.run_id or new_run_id())
         accounts = asyncio.run(list_accounts_run(paths, AuthPolicy(args.auth), run_id))
         for account_id, name in accounts:
             print(f"{_safe_output_field(account_id)}\t{_safe_output_field(name)}")
@@ -483,7 +573,7 @@ def dispatch(args: argparse.Namespace) -> int:
         )
         return 0
     if args.command == "collect":
-        run_id = _safe_run_id(args.run_id or new_run_id())
+        run_id = _usable_run_id(args.run_id or new_run_id())
         account_ids = _safe_account_ids(args.account)
         briefing = asyncio.run(
             collect_run(
@@ -497,8 +587,10 @@ def dispatch(args: argparse.Namespace) -> int:
         print(f"run={run_id} briefing={briefing}")
         return 0
     if args.command == "prepare-briefing":
-        run_id = _safe_run_id(args.run)
+        run_id = _usable_run_id(args.run)
         store.initialize()
+        _require_preparable_run(store, run_id)
+        _ensure_unpublished_run(paths, run_id)
         print(prepare_run(paths, store, run_id))
         return 0
     if args.command == "validate-briefing":
@@ -510,6 +602,7 @@ def dispatch(args: argparse.Namespace) -> int:
             label="briefing",
             max_bytes=_MAX_BRIEFING_BYTES,
         )
+        _validate_briefing_run_header(markdown, run_id)
         validate_briefing(markdown, bindings, require_unchecked=False)
         print("valid")
         return 0
@@ -522,6 +615,7 @@ def dispatch(args: argparse.Namespace) -> int:
             label="briefing",
             max_bytes=_MAX_BRIEFING_BYTES,
         )
+        _validate_briefing_run_header(markdown, run_id)
         validate_briefing(markdown, bindings, require_unchecked=False)
         destination = paths.exports_dir / f"{run_id}-selected"
         print(export_selected(selected_ids(markdown, bindings), paths.library_dir, destination))
@@ -554,7 +648,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         return dispatch(args)
     except _PUBLIC_ERRORS as exc:
-        print(f"{exc.__class__.__name__}: {exc}", file=sys.stderr)
+        safe_message = redact_text(
+            exc, one_line=True, max_characters=_MAX_PUBLIC_ERROR_TEXT
+        )
+        print(f"{exc.__class__.__name__}: {safe_message}", file=sys.stderr)
         return exc.exit_code if isinstance(exc, ShelfSignalError) else 1
 
 
