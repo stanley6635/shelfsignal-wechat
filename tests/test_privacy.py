@@ -71,3 +71,34 @@ def test_installed_redaction_covers_package_children_only(
     assert "child-secret" not in caplog.text
     assert "Authorization: [REDACTED]" in caplog.text
     assert "unrelated value=preserved" in caplog.text
+
+
+def test_package_exception_chain_and_stack_are_redacted_but_useful(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _install_redacting_filter()
+    package_child = logging.getLogger("shelfsignal.child.exception")
+    try:
+        try:
+            raise ValueError("Cookie: cause-secret")
+        except ValueError as cause:
+            raise RuntimeError("Authorization: Bearer exception-secret") from cause
+    except RuntimeError:
+        with caplog.at_level(logging.ERROR):
+            package_child.exception("collection failed", stack_info=True)
+
+    assert "cause-secret" not in caplog.text
+    assert "exception-secret" not in caplog.text
+    assert "ValueError" in caplog.text
+    assert "RuntimeError" in caplog.text
+    assert "Traceback" in caplog.text
+    assert "Stack" in caplog.text
+
+    caplog.clear()
+    unrelated = logging.getLogger("example.unrelated.exception")
+    try:
+        raise RuntimeError("Authorization: Bearer unrelated-secret")
+    except RuntimeError:
+        with caplog.at_level(logging.ERROR):
+            unrelated.exception("unrelated failed")
+    assert "unrelated-secret" in caplog.text

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import logging
 import os
 import re
 import shutil
 import stat
 import sys
-from collections.abc import Callable, Sequence
+import traceback
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,6 +56,7 @@ _MAX_OMISSION_TEXT = 500
 _MAX_BRIEFING_WARNINGS = 200
 _MAX_PUBLIC_ERROR_TEXT = 1_000
 _RESERVED_RUN_IDS = {"historical-seed"}
+_RUN_LOCK_NAME = ".shelfsignal.lock"
 _SECRET_HEADER = re.compile(
     r"(?is)\b(cookie|authorization)\s*:\s*"
     r"(?:(?!\b(?:cookie|authorization)\s*:|\r?\n).)*"
@@ -78,12 +82,28 @@ class RedactingFilter(logging.Filter):
     """Redact HTTP authentication headers after logging arguments are formatted."""
 
     def filter(self, record: logging.LogRecord) -> bool:
-        rendered = record.getMessage()
-        redacted = redact_text(rendered)
-        if redacted != rendered:
-            record.msg = redacted
-            record.args = ()
+        _redact_record(record)
         return True
+
+
+def _redact_record(record: logging.LogRecord) -> None:
+    """Sanitize every formatter-visible field on a ShelfSignal log record."""
+    if record.exc_info is not None:
+        record.exc_text = redact_text("".join(traceback.format_exception(*record.exc_info)))
+    elif record.exc_text is not None:
+        record.exc_text = redact_text(record.exc_text)
+    if record.stack_info is not None:
+        record.stack_info = redact_text(record.stack_info)
+    try:
+        rendered = record.getMessage()
+    except Exception:  # noqa: BLE001 - privacy filtering must never break logging
+        # Logging's own formatter will report a malformed message; never hide
+        # the original operational failure by raising from the privacy filter.
+        return
+    redacted = redact_text(rendered)
+    if redacted != rendered:
+        record.msg = redacted
+        record.args = ()
 
 
 def _install_redacting_filter() -> None:
@@ -94,11 +114,7 @@ def _install_redacting_filter() -> None:
     def redacting_factory(*args: object, **kwargs: object) -> logging.LogRecord:
         record = current_factory(*args, **kwargs)
         if record.name == "shelfsignal" or record.name.startswith("shelfsignal."):
-            rendered = record.getMessage()
-            redacted = redact_text(rendered)
-            if redacted != rendered:
-                record.msg = redacted
-                record.args = ()
+            _redact_record(record)
         return record
 
     redacting_factory._shelfsignal_redacting_factory = True  # type: ignore[attr-defined]
@@ -212,6 +228,59 @@ def _open_directory_chain(path: Path, label: str) -> int:
     except BaseException:
         os.close(descriptor)
         raise
+
+
+def _verify_run_lock(directory_fd: int, descriptor: int) -> None:
+    try:
+        current = os.stat(_RUN_LOCK_NAME, dir_fd=directory_fd, follow_symlinks=False)
+        opened = os.fstat(descriptor)
+    except OSError as exc:
+        raise StateError("run lease changed during acquisition") from exc
+    if (
+        not stat.S_ISREG(current.st_mode)
+        or not stat.S_ISREG(opened.st_mode)
+        or current.st_nlink != 1
+        or opened.st_nlink != 1
+        or opened.st_uid != os.getuid()
+        or (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino)
+    ):
+        raise StateError("run lease file is unsafe")
+
+
+@contextmanager
+def _run_lease(paths: WorkspacePaths, run_id: str) -> Iterator[None]:
+    """Hold a process-exclusive lease for one public run lifecycle."""
+    run_id = _usable_run_id(run_id)
+    run_dir = ensure_safe_directory(paths.runs_dir / run_id, label="run")
+    directory_fd = _open_directory_chain(run_dir, "run lease")
+    descriptor: int | None = None
+    try:
+        try:
+            descriptor = os.open(
+                _RUN_LOCK_NAME,
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_NONBLOCK", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+        except OSError as exc:
+            raise StateError("run lease file is unsafe") from exc
+        _verify_run_lock(directory_fd, descriptor)
+        os.fchmod(descriptor, 0o600)
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise StateError("another process is already operating on this run") from exc
+        except OSError as exc:
+            raise StateError("run lease could not be acquired") from exc
+        _verify_run_lock(directory_fd, descriptor)
+        yield
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        os.close(directory_fd)
 
 
 def _read_private_bytes(
@@ -507,6 +576,19 @@ async def collect_run(
     run_id = _usable_run_id(run_id)
     if type(lookback_days) is not int or not 0 <= lookback_days <= MAX_LOOKBACK_DAYS:
         raise ValueError(f"lookback days must be between 0 and {MAX_LOOKBACK_DAYS}")
+    with _run_lease(paths, run_id):
+        return await _collect_run_locked(
+            paths, auth_policy, lookback_days, run_id, account_ids
+        )
+
+
+async def _collect_run_locked(
+    paths: WorkspacePaths,
+    auth_policy: AuthPolicy,
+    lookback_days: int,
+    run_id: str,
+    account_ids: set[str] | None,
+) -> Path:
     store = StateStore(paths.state_db)
     store.initialize()
     details = store.run_details(run_id)
@@ -589,9 +671,10 @@ def dispatch(args: argparse.Namespace) -> int:
     if args.command == "prepare-briefing":
         run_id = _usable_run_id(args.run)
         store.initialize()
-        _require_preparable_run(store, run_id)
-        _ensure_unpublished_run(paths, run_id)
-        print(prepare_run(paths, store, run_id))
+        with _run_lease(paths, run_id):
+            _require_preparable_run(store, run_id)
+            _ensure_unpublished_run(paths, run_id)
+            print(prepare_run(paths, store, run_id))
         return 0
     if args.command == "validate-briefing":
         run_id, briefing = _briefing_context(paths, args.briefing)

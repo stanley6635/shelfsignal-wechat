@@ -254,9 +254,12 @@ def test_collect_run_marks_cancelled_run_failed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     paths = initialize_workspace(tmp_path / "runtime")
+    enter_calls = 0
 
     class CancelContext:
         async def __aenter__(self) -> object:
+            nonlocal enter_calls
+            enter_calls += 1
             raise asyncio.CancelledError
 
         async def __aexit__(self, *_args: object) -> None:
@@ -264,10 +267,14 @@ def test_collect_run_marks_cancelled_run_failed(
 
     monkeypatch.setattr(cli_module, "authenticated_context", lambda *_args: CancelContext())
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(
-            cli_module.collect_run(paths, cli_module.AuthPolicy.FRESH, 7, "run-001")
-        )
+    for _ in range(2):
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(
+                cli_module.collect_run(
+                    paths, cli_module.AuthPolicy.FRESH, 7, "run-001"
+                )
+            )
+    assert enter_calls == 2
     assert StateStore(paths.state_db).run_status("run-001") == "failed"
 
 
@@ -454,3 +461,94 @@ def test_manual_prepare_requires_existing_unpublished_interrupted_run(
             "historical-seed",
         ]
     ) == 1
+
+
+@pytest.mark.asyncio
+async def test_same_run_collect_lease_rejects_concurrent_caller_before_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = initialize_workspace(tmp_path / "runtime")
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    auth_calls = 0
+
+    class HoldingContext:
+        async def __aenter__(self) -> object:
+            nonlocal auth_calls
+            auth_calls += 1
+            entered.set()
+            await release.wait()
+            return type("Context", (), {"pages": [object()]})()
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "authenticated_context", lambda *_args: HoldingContext())
+    monkeypatch.setattr(cli_module, "ensure_helper", lambda path: path / "helper")
+
+    async def fake_process(*_args: object, **_kwargs: object) -> Path:
+        return paths.briefings_dir / "run-001.md"
+
+    monkeypatch.setattr(cli_module, "process_client_run", fake_process)
+    first = asyncio.create_task(
+        cli_module.collect_run(paths, cli_module.AuthPolicy.FRESH, 7, "run-001")
+    )
+    await entered.wait()
+    with pytest.raises(cli_module.StateError, match="already operating"):
+        await cli_module.collect_run(paths, cli_module.AuthPolicy.FRESH, 7, "run-001")
+    assert auth_calls == 1
+    release.set()
+    assert await first == paths.briefings_dir / "run-001.md"
+
+
+def test_collect_lease_releases_after_auth_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = initialize_workspace(tmp_path / "runtime")
+    auth_calls = 0
+
+    class FailingContext:
+        async def __aenter__(self) -> object:
+            nonlocal auth_calls
+            auth_calls += 1
+            raise AuthRequired("authorization required")
+
+        async def __aexit__(self, *_args: object) -> None:
+            return None
+
+    monkeypatch.setattr(cli_module, "authenticated_context", lambda *_args: FailingContext())
+    for _ in range(2):
+        with pytest.raises(AuthRequired):
+            asyncio.run(
+                cli_module.collect_run(
+                    paths, cli_module.AuthPolicy.FRESH, 7, "run-001"
+                )
+            )
+    assert auth_calls == 2
+    assert StateStore(paths.state_db).run_status("run-001") == "failed"
+
+
+@pytest.mark.parametrize("unsafe_kind", ["symlink", "directory", "hardlink"])
+def test_collect_rejects_unsafe_run_lock_leaf_before_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unsafe_kind: str
+) -> None:
+    paths = initialize_workspace(tmp_path / "runtime")
+    run_dir = paths.runs_dir / "run-001"
+    run_dir.mkdir()
+    lock = run_dir / ".shelfsignal.lock"
+    outside = tmp_path / "outside-lock"
+    outside.write_text("outside", encoding="utf-8")
+    if unsafe_kind == "symlink":
+        lock.symlink_to(outside)
+    elif unsafe_kind == "directory":
+        lock.mkdir()
+    else:
+        lock.hardlink_to(outside)
+    called = _prevent_auth(monkeypatch)
+
+    with pytest.raises(cli_module.StateError, match="unsafe"):
+        asyncio.run(
+            cli_module.collect_run(paths, cli_module.AuthPolicy.FRESH, 7, "run-001")
+        )
+    assert called == []
+    assert outside.read_text(encoding="utf-8") == "outside"
