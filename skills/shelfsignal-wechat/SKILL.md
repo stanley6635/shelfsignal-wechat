@@ -33,7 +33,12 @@ description: Collect WeChat Official Account articles from an authenticated WeRe
    values. Run
    `shelfsignal validate-briefing --workspace <path> <briefing-path>` and repair
    only errors introduced by the ranking edit.
-8. Present the briefing path and wait for the user to check items.
+8. Present the complete numbered candidate list and ask the user which numbers
+   or article IDs to select. After the user answers, patch only the exact
+   matching checkbox tokens from `[ ]` to `[x]`; preserve every other byte and
+   immutable field. Never ask the user to save the bound briefing in an
+   arbitrary Markdown or rich-text editor. Run `validate-briefing` again after
+   the checkbox patch.
 9. After the user asks to continue, run
    `shelfsignal export --workspace <path> --briefing <briefing-path>`.
 10. Return the selected bundle and stop. Let the current target project's

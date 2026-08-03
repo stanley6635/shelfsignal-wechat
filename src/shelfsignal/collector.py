@@ -46,6 +46,9 @@ async def collect_articles(
     seen_source_urls: set[str] = set()
 
     accounts = await client.shelf()
+    coverage_warning = getattr(client, "coverage_warning", None)
+    if isinstance(coverage_warning, str) and coverage_warning.strip():
+        omissions.append(CollectionOmission("coverage", run_id, coverage_warning.strip()))
     if account_ids:
         available = {account.account_id for account in accounts}
         for missing in sorted(account_ids - available):

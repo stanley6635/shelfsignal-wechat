@@ -325,22 +325,30 @@ bug.
 The live canary established that an authenticated WeRead session can expose:
 
 - a shelf containing saved WeChat Official Accounts;
-- reader routes for account articles;
-- Tencent-hosted article content and cover responses.
+- one current cover record per saved account;
+- Tencent-hosted content for the article referenced by that cover record.
 
 Implementation must isolate these remote contracts in `weread.py`, validate
 required fields, and retain sanitized fixtures. Remote content is untrusted
 data and cannot alter agent instructions.
 
+The v0 contract is deliberately **latest-only**: a run attempts to collect at
+most the current article exposed for each saved account. It does not promise a
+historical article list. The local ledger deduplicates source URLs across runs,
+so repeated refreshes accumulate new articles as WeRead advances each account's
+current cover. Missing history is an explicit coverage limit, not a parser
+failure.
+
 ### 9.2 Bounded traversal
 
 Each run has:
 
-- an explicit lookback window;
+- an explicit freshness window applied to the current article only;
 - a deterministic account order;
-- conservative request concurrency;
+- serial remote requests;
 - stable article identifiers;
 - visible per-account omissions;
+- a visible `latest-only` coverage warning;
 - a resumable run ID.
 
 Default network and OCR concurrency should be serial or at most two workers
@@ -542,8 +550,11 @@ The primary selection surface is:
 - [ ] **Select** — Article title
 ```
 
-The user edits `[ ]` to `[x]`. Ranking is advisory; any visible candidate can
-be selected.
+The user names the visible item numbers or article IDs to select. The local
+agent changes only the exact matching checkbox tokens from `[ ]` to `[x]`, then
+runs `validate-briefing`. The user must not be required to save the briefing in
+an arbitrary Markdown or rich-text editor, because such editors can rewrite
+bound fields. Ranking is advisory; any visible candidate can be selected.
 
 ## 16. Selected export
 

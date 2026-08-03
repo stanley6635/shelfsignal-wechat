@@ -77,6 +77,11 @@ shelfsignal collect \
   --lookback-days 7
 ```
 
+The WeRead v0 adapter is intentionally latest-only: it reads at most the
+current article exposed for each saved Official Account. `--lookback-days` is
+a freshness filter for those current articles; it does not request a historical
+list. Repeated runs use the local ledger to skip source URLs already collected.
+
 `fresh` asks for one QR authorization for that new run. If the process is
 interrupted, retry with the same run ID and the same authentication policy;
 the running or failed run reuses its saved session and completed article
@@ -88,6 +93,11 @@ unchecked briefing. Do not routinely run `prepare-briefing` after a successful
 collection. A completed run is immutable and cannot be collected again; use a
 new run ID for the next briefing. `prepare-briefing` is a recovery command for
 an eligible unfinished run, not a second daily step.
+
+For selection, tell the local agent which visible item numbers or article IDs
+you want. The agent patches only their checkbox tokens and validates the result
+before export: selected lines change from `- [ ]` to `- [x]`. Do not save the
+bound briefing through a rich Markdown editor.
 
 To inspect the saved accounts before a canary, use a known run ID as well:
 
@@ -106,9 +116,9 @@ The Skill runs collection, reads the compact cards and private profile, ranks
 all candidates, and leaves every item unchecked. It validates the briefing
 before presenting its path.
 
-Review the Markdown and change only the desired lines from `- [ ]` to `- [x]`.
-Then ask the local agent to continue. The Skill validates the edited briefing
-and exports only checked articles:
+Review the Markdown, tell the local agent which visible items you want, and let
+it patch only those checkbox tokens. The Skill validates the briefing and
+exports only checked articles:
 
 ```bash
 shelfsignal validate-briefing \

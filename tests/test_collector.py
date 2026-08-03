@@ -19,7 +19,12 @@ from shelfsignal.models import (
     RemoteArticle,
     ShelfAccount,
 )
-from shelfsignal.weread import PlaywrightWeReadClient
+from shelfsignal.weread import (
+    PlaywrightWeReadClient,
+    parse_cover_book_ids,
+    parse_cover_payload,
+    parse_latest_html_metadata,
+)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"fictional-pixels"
 
@@ -71,6 +76,19 @@ async def test_collector_applies_window_and_records_complete_article(tmp_path: P
     assert [item.article.article_id for item in result.stored] == ["article-1"]
     assert result.stored[0].status is ArticleStatus.COMPLETE
     assert result.omissions == ()
+
+
+@pytest.mark.asyncio
+async def test_collector_exposes_latest_only_coverage_warning(tmp_path: Path):
+    client = FakeClient()
+    client.coverage_warning = "latest-only: historical articles are not traversed"
+    result = await collect_articles(client, tmp_path / "library", 7, "run-001")
+    assert any(
+        item.scope == "coverage"
+        and item.identifier == "run-001"
+        and item.reason.startswith("latest-only:")
+        for item in result.omissions
+    )
 
 
 @pytest.mark.asyncio
@@ -368,6 +386,9 @@ class FakeResponse:
     async def json(self):
         return self._payload
 
+    async def text(self):
+        return self._body.decode("utf-8")
+
 
 class FakeRequest:
     def __init__(self, response: FakeResponse) -> None:
@@ -432,10 +453,7 @@ async def test_playwright_asset_rejects_unsafe_initial_url_before_request():
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("method", "endpoint", "response_url"),
-    [
-        ("articles", "https://weread.qq.com/web/book/read", "https://evil.invalid/web/book/read"),
-        ("content", "https://weread.qq.com/web/mp/content", "https://evil.invalid/web/mp/content"),
-    ],
+    [("content", "https://weread.qq.com/web/mp/content", "https://evil.invalid/web/mp/content")],
 )
 async def test_playwright_api_rejects_unexpected_final_endpoint(
     method: str, endpoint: str, response_url: str
@@ -457,7 +475,7 @@ async def test_playwright_api_rejects_unexpected_final_endpoint(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("method", ["articles", "content"])
+@pytest.mark.parametrize("method", ["content"])
 @pytest.mark.parametrize(
     ("url", "status"),
     [("https://weread.qq.com/web/login", 200), ("https://weread.qq.com/web/mp/content", 401)],
@@ -465,7 +483,7 @@ async def test_playwright_api_rejects_unexpected_final_endpoint(
 async def test_playwright_api_classifies_login_and_unauthorized_as_auth_required(
     method: str, url: str, status: int
 ):
-    expected_path = "/web/book/read" if method == "articles" else "/web/mp/content"
+    expected_path = "/web/mp/content"
     if status == 401:
         url = f"https://weread.qq.com{expected_path}"
     response = FakeResponse(url=url, status=status)
@@ -507,6 +525,202 @@ class FakePage:
 
     async def content(self):
         return '<a data-book-type="official-account" data-book-id="account-1"><span class="title">Example</span></a>'
+
+
+def test_cover_resource_parser_is_exact_deduplicated_and_safe():
+    urls = [
+        "https://weread.qq.com/web/mp/cover?bookId=book-2",
+        "https://weread.qq.com/web/mp/cover?bookId=book-1",
+        "https://weread.qq.com/web/mp/cover?bookId=book-1",
+        "https://evil.invalid/web/mp/cover?bookId=evil",
+        "https://weread.qq.com/web/mp/cover?bookId=book-3&extra=1",
+        "https://weread.qq.com/web/mp/content?bookId=wrong-path",
+        "not a URL",
+    ]
+    assert parse_cover_book_ids(urls) == ("book-1", "book-2")
+
+
+def test_cover_resource_parser_rejects_missing_contract():
+    with pytest.raises(ShelfUnavailable, match="cover responses"):
+        parse_cover_book_ids(["https://weread.qq.com/web/mp/content?bookId=none"])
+
+
+def test_cover_payload_builds_one_latest_seed():
+    seed = parse_cover_payload(
+        {"name": " Example Account ", "title": " Latest Article ", "reviewId": "review-1"},
+        "book-1",
+    )
+    assert seed.account == ShelfAccount("book-1", "Example Account")
+    assert (seed.article_id, seed.review_id, seed.title) == (
+        "review-1",
+        "review-1",
+        "Latest Article",
+    )
+
+
+def test_cover_payload_hashes_remote_id_that_is_unsafe_for_local_paths():
+    seed = parse_cover_payload(
+        {"name": "Account", "title": "Latest", "reviewId": "remote~review"},
+        "book-1",
+    )
+    assert seed.review_id == "remote~review"
+    assert seed.article_id.startswith("review-")
+    assert "~" not in seed.article_id
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"name": "", "title": "Title", "reviewId": "review-1"},
+    ],
+)
+def test_cover_payload_rejects_incomplete_fields(payload):
+    with pytest.raises(ContentContractUnavailable):
+        parse_cover_payload(payload, "book-1")
+
+
+def test_latest_html_metadata_uses_publication_time_and_canonical_url():
+    published, source_url = parse_latest_html_metadata(
+        '<meta property="og:url" content="https://mp.weixin.qq.com/s?a=1\\u0026b=2">'
+        '<script>var ct = "1722600000";</script>'
+    )
+    assert published == datetime.fromtimestamp(1722600000, tz=UTC)
+    assert source_url == "https://mp.weixin.qq.com/s?a=1&b=2"
+
+
+def test_latest_html_metadata_supports_script_source_fallback():
+    published, source_url = parse_latest_html_metadata(
+        '<script>publish_time: 1722600000, msg_link: '
+        '"https://mp.weixin.qq.com/s?x=1\\u0026y=2"</script>'
+    )
+    assert published == datetime.fromtimestamp(1722600000, tz=UTC)
+    assert source_url == "https://mp.weixin.qq.com/s?x=1&y=2"
+
+
+@pytest.mark.parametrize(
+    "html",
+    [
+        '<meta property="og:url" content="https://example.invalid/a">',
+        '<script>ct = "1722600000"</script>',
+        '<meta property="og:url" content="http://example.invalid/a"><script>ct=1722600000</script>',
+    ],
+)
+def test_latest_html_metadata_rejects_missing_or_unsafe_fields(html):
+    with pytest.raises(ContentContractUnavailable):
+        parse_latest_html_metadata(html)
+
+
+class LatestOnlyRequest:
+    def __init__(self) -> None:
+        self.content_calls = 0
+
+    async def get(self, url, **kwargs):
+        params = kwargs.get("params", {})
+        if url.endswith("/cover"):
+            book_id = params["bookId"]
+            return FakeResponse(
+                url="https://weread.qq.com/web/mp/cover",
+                content_type="application/json",
+                payload={
+                    "name": f"Account {book_id}",
+                    "title": f"Latest {book_id}",
+                    "reviewId": f"review-{book_id}",
+                },
+            )
+        self.content_calls += 1
+        article_id = params["reviewId"]
+        body = (
+            f'<meta property="og:url" content="https://mp.weixin.qq.com/s/{article_id}">'
+            '<script>ct = "1722600000"</script><p>Body.</p>'
+        ).encode()
+        return FakeResponse(
+            url="https://weread.qq.com/web/mp/content",
+            content_type="text/plain; charset=utf-8",
+            body=body,
+        )
+
+
+class LatestOnlyContext:
+    def __init__(self) -> None:
+        self.request = LatestOnlyRequest()
+
+
+class LatestOnlyPage:
+    url = "https://weread.qq.com/web/shelf"
+
+    async def goto(self, url, **kwargs):
+        return FakeResponse(url=self.url)
+
+    async def reload(self, **kwargs):
+        return FakeResponse(url=self.url)
+
+    async def wait_for_selector(self, selector, **kwargs):
+        return object()
+
+    async def wait_for_load_state(self, state, **kwargs):
+        return None
+
+    async def content(self):
+        return (
+            '<a class="shelfBook" href="/web/mp/reader/encoded-1"><div class="title">One</div></a>'
+            '<a class="shelfBook" href="/web/mp/reader/encoded-2"><div class="title">Two</div></a>'
+        )
+
+    async def evaluate(self, expression):
+        return [
+            "https://weread.qq.com/web/mp/cover?bookId=book-2",
+            "https://weread.qq.com/web/mp/cover?bookId=book-1",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_latest_only_client_uses_cover_and_caches_direct_html_content():
+    context = LatestOnlyContext()
+    client = PlaywrightWeReadClient(context, LatestOnlyPage())
+    accounts = await client.shelf()
+    assert [item.account_id for item in accounts] == ["book-1", "book-2"]
+
+    articles = await client.articles(accounts[0])
+    assert len(articles) == 1
+    assert articles[0].article_id == "review-book-1"
+    assert articles[0].source_url == "https://mp.weixin.qq.com/s/review-book-1"
+    content = await client.content(articles[0])
+    assert "<p>Body.</p>" in content.html
+    assert context.request.content_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_latest_only_shelf_fails_closed_on_cover_count_mismatch():
+    class MismatchedPage(LatestOnlyPage):
+        async def evaluate(self, expression):
+            return ["https://weread.qq.com/web/mp/cover?bookId=book-1"]
+
+    with pytest.raises(ShelfUnavailable, match="count does not match"):
+        await PlaywrightWeReadClient(LatestOnlyContext(), MismatchedPage()).shelf()
+
+
+@pytest.mark.asyncio
+async def test_latest_only_shelf_reloads_once_after_partial_first_render():
+    class TransientPage(LatestOnlyPage):
+        def __init__(self):
+            self.resource_reads = 0
+            self.reloads = 0
+
+        async def reload(self, **kwargs):
+            self.reloads += 1
+            return await super().reload(**kwargs)
+
+        async def evaluate(self, expression):
+            self.resource_reads += 1
+            if self.resource_reads == 1:
+                return ["https://weread.qq.com/web/mp/cover?bookId=book-1"]
+            return await super().evaluate(expression)
+
+    page = TransientPage()
+    accounts = await PlaywrightWeReadClient(LatestOnlyContext(), page).shelf()
+    assert [item.account_id for item in accounts] == ["book-1", "book-2"]
+    assert page.reloads == 1
 
 
 @pytest.mark.asyncio

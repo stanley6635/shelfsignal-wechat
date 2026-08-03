@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
+from html import unescape
 from html.parser import HTMLParser
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from playwright.async_api import BrowserContext, Page
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
@@ -20,15 +24,24 @@ from .errors import (
 from .models import ArticleContent, RemoteArticle, ShelfAccount
 
 SHELF_URL = "https://weread.qq.com/web/shelf"
-BOOK_READ_URL = "https://weread.qq.com/web/book/read"
+COVER_URL = "https://weread.qq.com/web/mp/cover"
 MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
 MAX_ASSET_BYTES = 25 * 1024 * 1024
+MAX_ARTICLE_HTML_BYTES = 25 * 1024 * 1024
 SHELF_RENDER_TIMEOUT_MS = 30_000
 SHELF_ACCOUNT_SELECTOR = (
     'a[data-book-type="official-account"], '
     'a.shelfBook[href*="/web/mp/reader/"]:not(.shelfBook_add)'
 )
 _ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_SAFE_LOCAL_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_PUBLISH_TIME_PATTERN = re.compile(
+    r"(?:\bct\b|\bpublish_time\b)\s*[:=]\s*['\"]?(\d{10})"
+)
+_SOURCE_FIELD_PATTERN = re.compile(
+    r"(?:\bmsg_link\b|\bsource_url\b|\bcontent_url\b)\s*[:=]\s*(\"(?:\\.|[^\"])*\")"
+)
+_UNICODE_ESCAPE_PATTERN = re.compile(r"\\u([0-9A-Fa-f]{4})")
 _VOID_HTML_TAGS = {
     "area",
     "base",
@@ -70,10 +83,26 @@ class ArticleClient(Protocol):
     async def asset(self, url: str) -> bytes: ...
 
 
+@dataclass(frozen=True)
+class _LatestSeed:
+    account: ShelfAccount
+    article_id: str
+    review_id: str
+    title: str
+
+
 class PlaywrightWeReadClient:
+    coverage_warning = (
+        "latest-only: WeRead exposes at most the current article for each saved account; "
+        "historical articles are not traversed"
+    )
+
     def __init__(self, context: BrowserContext, page: Page):
         self.context = context
         self.page = page
+        self._latest_by_account: dict[str, _LatestSeed] = {}
+        self._content_by_article: dict[str, ArticleContent] = {}
+        self._review_by_article: dict[str, str] = {}
 
     async def shelf(self) -> tuple[ShelfAccount, ...]:
         try:
@@ -82,28 +111,41 @@ class PlaywrightWeReadClient:
             raise
         except Exception as exc:
             raise ShelfUnavailable("saved shelf request failed") from exc
-        if response is None:
-            raise ShelfUnavailable("saved shelf request failed: no response")
-        response_path = _trusted_path(
-            getattr(response, "url", ""),
-            {"/web/shelf", "/web/login"},
-            ShelfUnavailable,
-            "saved shelf returned an unexpected endpoint",
-        )
-        page_path = _trusted_path(
-            getattr(self.page, "url", ""),
-            {"/web/shelf", "/web/login"},
-            ShelfUnavailable,
-            "saved shelf returned an unexpected endpoint",
-        )
-        status = getattr(response, "status", None)
-        ok = getattr(response, "ok", None)
-        if type(status) is not int or not isinstance(ok, bool):
-            raise ShelfUnavailable("saved shelf returned an invalid response")
-        if response_path == "/web/login" or page_path == "/web/login" or status in {401, 403}:
-            raise AuthRequired("WeRead authorization is required")
-        if not ok:
-            raise ShelfUnavailable(f"saved shelf request failed: HTTP {status}")
+        _validate_shelf_navigation(response, getattr(self.page, "url", ""))
+        for attempt in range(2):
+            dom_accounts, book_ids = await self._shelf_snapshot()
+            if book_ids is None:
+                return dom_accounts
+            if len(book_ids) == len(dom_accounts):
+                break
+            if attempt == 1:
+                raise ShelfUnavailable(
+                    "saved shelf account count does not match its cover responses"
+                )
+            try:
+                response = await self.page.reload(wait_until="domcontentloaded")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ShelfUnavailable("saved shelf refresh failed") from exc
+            _validate_shelf_navigation(response, getattr(self.page, "url", ""))
+        latest: dict[str, _LatestSeed] = {}
+        for book_id in book_ids:
+            response = await self.context.request.get(COVER_URL, params={"bookId": book_id})
+            _validate_api_response(response, "/web/mp/cover", "mp/cover")
+            if not response.ok:
+                raise ContentContractUnavailable(
+                    f"mp/cover returned HTTP {response.status}"
+                )
+            seed = parse_cover_payload(await _response_json(response, "mp/cover"), book_id)
+            latest[book_id] = seed
+            self._review_by_article[seed.article_id] = seed.review_id
+        self._latest_by_account = latest
+        return tuple(latest[key].account for key in sorted(latest))
+
+    async def _shelf_snapshot(
+        self,
+    ) -> tuple[tuple[ShelfAccount, ...], tuple[str, ...] | None]:
         try:
             await self.page.wait_for_selector(
                 SHELF_ACCOUNT_SELECTOR,
@@ -119,42 +161,76 @@ class PlaywrightWeReadClient:
         except Exception as exc:
             raise ShelfUnavailable("saved shelf could not finish rendering") from exc
         try:
+            await self.page.wait_for_load_state("networkidle", timeout=5_000)
+        except (PlaywrightTimeoutError, AttributeError):
+            pass
+        try:
             html = await self.page.content()
         except asyncio.CancelledError:
             raise
         except Exception as exc:
             raise ShelfUnavailable("saved shelf content could not be read") from exc
-        return parse_shelf_html(html)
+        dom_accounts = parse_shelf_html(html)
+        if 'data-book-type="official-account"' in html:
+            return dom_accounts, None
+        try:
+            resource_urls = await self.page.evaluate(
+                "performance.getEntriesByType('resource').map((entry) => entry.name)"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            raise ShelfUnavailable("saved shelf cover requests could not be read") from exc
+        return dom_accounts, parse_cover_book_ids(resource_urls)
 
     async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
-        response = await self.context.request.post(
-            BOOK_READ_URL,
-            data={"bookId": account.account_id},
+        seed = self._latest_by_account.get(account.account_id)
+        if seed is None:
+            raise ContentContractUnavailable("latest cover is missing for shelf account")
+        content = await self._fetch_content(seed.review_id, seed.article_id)
+        published_at, source_url = parse_latest_html_metadata(content.html)
+        return (
+            RemoteArticle(
+                article_id=seed.article_id,
+                account_id=account.account_id,
+                account_name=account.name,
+                title=seed.title,
+                source_url=source_url,
+                published_at=published_at,
+            ),
         )
-        _validate_api_response(response, "/web/book/read", "book/read")
-        if not response.ok:
-            raise ContentContractUnavailable(
-                f"book/read returned HTTP {response.status}"
-            )
-        return parse_book_read(await _response_json(response, "book/read"), account)
 
     async def content(self, article: RemoteArticle) -> ArticleContent:
+        cached = self._content_by_article.get(article.article_id)
+        if cached is not None:
+            return cached
+        review_id = self._review_by_article.get(article.article_id, article.article_id)
+        return await self._fetch_content(review_id, article.article_id)
+
+    async def _fetch_content(self, review_id: str, article_id: str) -> ArticleContent:
         response = await self.context.request.get(
             MP_CONTENT_URL,
-            params={"reviewId": article.article_id},
+            params={"reviewId": review_id},
         )
         _validate_api_response(response, "/web/mp/content", "mp/content")
         if response.status == 404:
             raise ArticleBodyUnavailable(
-                f"article body unavailable: {article.article_id}"
+                f"article body unavailable: {article_id}"
             )
         if not response.ok:
             raise ContentContractUnavailable(
                 f"mp/content returned HTTP {response.status}"
             )
-        content = parse_article_content(await _response_json(response, "mp/content"))
-        if content.article_id != article.article_id:
-            raise ContentContractUnavailable("article content ID does not match request")
+        content_type = getattr(response, "headers", {}).get("content-type", "")
+        if isinstance(content_type, str) and "json" in content_type.lower():
+            content = parse_article_content(await _response_json(response, "mp/content"))
+            if content.article_id != review_id:
+                raise ContentContractUnavailable("article content ID does not match request")
+            content = ArticleContent(article_id, content.html, content.image_urls)
+        else:
+            body = await _response_text(response, "mp/content")
+            content = ArticleContent(article_id, body, ())
+        self._content_by_article[article_id] = content
         return content
 
     async def asset(self, url: str) -> bytes:
@@ -204,6 +280,45 @@ async def _response_json(response: object, label: str) -> object:
         raise
     except Exception as exc:
         raise ContentContractUnavailable(f"{label} returned invalid JSON") from exc
+
+
+async def _response_text(response: object, label: str) -> str:
+    try:
+        body = await response.text()
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        raise ContentContractUnavailable(f"{label} returned unreadable text") from exc
+    if not isinstance(body, str) or not body.strip():
+        raise ContentContractUnavailable(f"{label} returned an empty body")
+    if len(body.encode("utf-8")) > MAX_ARTICLE_HTML_BYTES:
+        raise ContentContractUnavailable(f"{label} exceeded the body size limit")
+    return body
+
+
+def _validate_shelf_navigation(response: object, page_url: object) -> None:
+    if response is None:
+        raise ShelfUnavailable("saved shelf request failed: no response")
+    response_path = _trusted_path(
+        getattr(response, "url", ""),
+        {"/web/shelf", "/web/login"},
+        ShelfUnavailable,
+        "saved shelf returned an unexpected endpoint",
+    )
+    page_path = _trusted_path(
+        page_url,
+        {"/web/shelf", "/web/login"},
+        ShelfUnavailable,
+        "saved shelf returned an unexpected endpoint",
+    )
+    status = getattr(response, "status", None)
+    ok = getattr(response, "ok", None)
+    if type(status) is not int or not isinstance(ok, bool):
+        raise ShelfUnavailable("saved shelf returned an invalid response")
+    if response_path == "/web/login" or page_path == "/web/login" or status in {401, 403}:
+        raise AuthRequired("WeRead authorization is required")
+    if not ok:
+        raise ShelfUnavailable(f"saved shelf request failed: HTTP {status}")
 
 
 def _validate_api_response(response: object, expected_path: str, label: str) -> None:
@@ -273,6 +388,131 @@ def _raster_kind(content: bytes) -> str | None:
         if brand in {b"heic", b"heix", b"hevc", b"hevx", b"mif1", b"msf1"}:
             return "heic"
     return None
+
+
+def parse_cover_book_ids(resource_urls: object) -> tuple[str, ...]:
+    if not isinstance(resource_urls, list) or not all(
+        isinstance(item, str) for item in resource_urls
+    ):
+        raise ShelfUnavailable("saved shelf resource list changed type")
+    book_ids: set[str] = set()
+    for url in resource_urls:
+        try:
+            parsed = urlsplit(url)
+        except ValueError:
+            continue
+        if (
+            parsed.scheme != "https"
+            or parsed.netloc != "weread.qq.com"
+            or parsed.path != "/web/mp/cover"
+            or parsed.fragment
+        ):
+            continue
+        try:
+            query = parse_qs(parsed.query, keep_blank_values=True, strict_parsing=True)
+        except ValueError:
+            continue
+        if set(query) != {"bookId"} or len(query["bookId"]) != 1:
+            continue
+        book_id = query["bookId"][0]
+        if _ACCOUNT_ID_PATTERN.fullmatch(book_id):
+            book_ids.add(book_id)
+    if not book_ids:
+        raise ShelfUnavailable("saved shelf did not expose readable cover responses")
+    return tuple(sorted(book_ids))
+
+
+def parse_cover_payload(payload: object, book_id: str) -> _LatestSeed:
+    if not _ACCOUNT_ID_PATTERN.fullmatch(book_id):
+        raise ContentContractUnavailable("cover book ID is invalid")
+    if not isinstance(payload, dict):
+        raise ContentContractUnavailable("cover payload changed type")
+    name = payload.get("name")
+    title = payload.get("title")
+    article_id = payload.get("reviewId")
+    if not isinstance(name, str) or not (name := " ".join(name.split())):
+        raise ContentContractUnavailable("cover account name is missing")
+    if not isinstance(title, str) or not (title := " ".join(title.split())):
+        raise ContentContractUnavailable("cover article title is missing")
+    if not isinstance(article_id, str):
+        raise ContentContractUnavailable(
+            f"cover article ID changed type: {type(article_id).__name__}"
+        )
+    article_id = article_id.strip()
+    if not article_id:
+        raise ContentContractUnavailable("cover article ID is empty")
+    if len(article_id) > 512 or any(ord(character) < 32 for character in article_id):
+        raise ContentContractUnavailable("cover article ID is invalid")
+    if max(len(name), len(title)) > 2_000:
+        raise ContentContractUnavailable("cover text exceeds the size limit")
+    account = ShelfAccount(book_id, name)
+    local_id = _local_article_id(article_id)
+    return _LatestSeed(account, local_id, article_id, title)
+
+
+def _local_article_id(review_id: str) -> str:
+    if _SAFE_LOCAL_ARTICLE_ID.fullmatch(review_id):
+        return review_id
+    digest = hashlib.sha256(review_id.encode("utf-8")).hexdigest()
+    return f"review-{digest[:24]}"
+
+
+class _SourceURLParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.source_url: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "meta" or self.source_url is not None:
+            return
+        values = dict(attrs)
+        key = values.get("property") or values.get("name")
+        content = values.get("content")
+        if key in {"og:url", "article:url"} and isinstance(content, str):
+            self.source_url = unescape(content.strip())
+
+
+def parse_latest_html_metadata(html: object) -> tuple[datetime, str]:
+    if not isinstance(html, str) or not html.strip():
+        raise ContentContractUnavailable("article HTML is empty")
+    if len(html.encode("utf-8")) > MAX_ARTICLE_HTML_BYTES:
+        raise ContentContractUnavailable("article HTML exceeds the size limit")
+    timestamp_match = _PUBLISH_TIME_PATTERN.search(html)
+    if timestamp_match is None:
+        raise ContentContractUnavailable("article publication time is missing")
+    try:
+        published_at = datetime.fromtimestamp(int(timestamp_match.group(1)), tz=UTC)
+    except (OverflowError, OSError, ValueError) as exc:
+        raise ContentContractUnavailable("article publication time is invalid") from exc
+
+    parser = _SourceURLParser()
+    parser.feed(html)
+    source_url = parser.source_url
+    if source_url is None:
+        match = _SOURCE_FIELD_PATTERN.search(html)
+        if match is not None:
+            try:
+                decoded = json.loads(match.group(1))
+            except (json.JSONDecodeError, TypeError):
+                decoded = None
+            if isinstance(decoded, str):
+                source_url = unescape(decoded.strip())
+    if not isinstance(source_url, str):
+        raise ContentContractUnavailable("article source URL is missing")
+    source_url = _decode_url_escapes(source_url)
+    try:
+        parsed = urlsplit(source_url)
+    except ValueError as exc:
+        raise ContentContractUnavailable("article source URL is invalid") from exc
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ContentContractUnavailable("article source URL is invalid")
+    return published_at, source_url
+
+
+def _decode_url_escapes(value: str) -> str:
+    return _UNICODE_ESCAPE_PATTERN.sub(
+        lambda match: chr(int(match.group(1), 16)), value
+    ).replace(r"\x26", "&")
 
 
 class _ShelfParser(HTMLParser):
