@@ -659,6 +659,12 @@ class LatestOnlyRequest:
                     "reviewId": f"review-{book_id}",
                 },
             )
+        if url.endswith("/bookread"):
+            return FakeResponse(
+                url="https://weread.qq.com/web/mp/bookread",
+                content_type="application/json",
+                payload={"chapterInfos": []},
+            )
         self.content_calls += 1
         article_id = params["reviewId"]
         body = (

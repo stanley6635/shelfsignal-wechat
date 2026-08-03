@@ -17,7 +17,7 @@ from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from .errors import AuthRequired, ShelfUnavailable
 
 SHELF_URL = "https://weread.qq.com/web/shelf"
-AUTHORIZATION_TIMEOUT_MS = 180_000
+AUTHORIZATION_TIMEOUT_MS = int(os.environ.get("SHELFSIGNAL_AUTH_TIMEOUT_MS", "180000"))
 AUTH_POLL_INTERVAL_MS = 1_000
 EMBEDDED_LOGIN_SELECTOR = ".navBar_link_Login"
 EMBEDDED_QR_SELECTOR = 'iframe[src*="/connect/qrconnect"]'

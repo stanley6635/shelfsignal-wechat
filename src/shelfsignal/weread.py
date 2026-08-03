@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 from typing import Protocol
@@ -26,6 +26,8 @@ from .models import ArticleContent, RemoteArticle, ShelfAccount
 SHELF_URL = "https://weread.qq.com/web/shelf"
 COVER_URL = "https://weread.qq.com/web/mp/cover"
 MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
+BOOKREAD_URL = "https://weread.qq.com/web/mp/bookread"
+_LOOKBACK_TZ = timezone(timedelta(hours=8))
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_ARTICLE_HTML_BYTES = 25 * 1024 * 1024
 SHELF_RENDER_TIMEOUT_MS = 30_000
@@ -92,14 +94,12 @@ class _LatestSeed:
 
 
 class PlaywrightWeReadClient:
-    coverage_warning = (
-        "latest-only: WeRead exposes at most the current article for each saved account; "
-        "historical articles are not traversed"
-    )
+    coverage_warning = None
 
-    def __init__(self, context: BrowserContext, page: Page):
+    def __init__(self, context: BrowserContext, page: Page, *, lookback_days: int = 2):
         self.context = context
         self.page = page
+        self._lookback_days = lookback_days
         self._latest_by_account: dict[str, _LatestSeed] = {}
         self._content_by_article: dict[str, ArticleContent] = {}
         self._review_by_article: dict[str, str] = {}
@@ -184,6 +184,32 @@ class PlaywrightWeReadClient:
         return dom_accounts, parse_cover_book_ids(resource_urls)
 
     async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
+        try:
+            articles = await self._articles_from_bookread(account)
+            if articles:
+                return articles
+        except (AuthRequired, ContentContractUnavailable):
+            raise
+        except Exception:
+            pass
+        return await self._articles_from_cover(account)
+
+    async def _articles_from_bookread(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
+        response = await self.context.request.get(
+            BOOKREAD_URL,
+            params={"bookId": account.account_id},
+        )
+        _validate_api_response(response, "/web/mp/bookread", "mp/bookread")
+        if not response.ok:
+            raise ContentContractUnavailable(
+                f"mp/bookread returned HTTP {response.status}"
+            )
+        payload = await _response_json(response, "mp/bookread")
+        articles = parse_book_read(payload, account)
+        cutoff = _lookback_cutoff(self._lookback_days)
+        return tuple(article for article in articles if article.published_at >= cutoff)
+
+    async def _articles_from_cover(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
         seed = self._latest_by_account.get(account.account_id)
         if seed is None:
             raise ContentContractUnavailable("latest cover is missing for shelf account")
@@ -609,6 +635,16 @@ def parse_article_content(payload: object) -> ArticleContent:
     if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
         raise ContentContractUnavailable("article image list has changed type")
     return ArticleContent(article_id, body, tuple(dict.fromkeys(images)))
+
+
+def _lookback_cutoff(lookback_days: int) -> datetime:
+    """Cutoff at the start of (today - lookback_days + 1) in Beijing time.
+
+    lookback_days=2 → yesterday 00:00 Beijing time → "前一天 0 点到今天".
+    """
+    now_local = datetime.now(_LOOKBACK_TZ)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return today_start - timedelta(days=max(lookback_days - 1, 0))
 
 
 def parse_book_read(
