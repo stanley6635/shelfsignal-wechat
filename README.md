@@ -1,5 +1,7 @@
 # ShelfSignal for WeChat
 
+[English](README.md) | [简体中文](README.zh-CN.md)
+
 Local-first WeChat Official Account article collection for local AI agents.
 
 ShelfSignal captures full text and meaningful images from an authenticated
