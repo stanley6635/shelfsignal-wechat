@@ -189,6 +189,37 @@ async def test_existing_article_identity_conflict_is_global_contract_failure(tmp
 
 
 @pytest.mark.asyncio
+async def test_existing_wechat_article_accepts_tracking_url_variation(tmp_path: Path):
+    class WeChatClient(FakeClient):
+        source_url = (
+            "https://mp.weixin.qq.com/s?__biz=demo&mid=100&idx=1&sn=stable"
+        )
+
+        async def articles(self, account):
+            article = (await super().articles(account))[0]
+            return (
+                RemoteArticle(
+                    article.article_id,
+                    article.account_id,
+                    article.account_name,
+                    article.title,
+                    self.source_url,
+                    article.published_at,
+                ),
+            )
+
+    library = tmp_path / "library"
+    first = await collect_articles(WeChatClient(), library, 7, "run-001")
+
+    retry = WeChatClient()
+    retry.source_url = (
+        "https://mp.weixin.qq.com/s?idx=1\\u0026mid=100\\u0026__biz=demo\\u0026scene=1"
+    )
+    second = await collect_articles(retry, library, 7, "run-001")
+    assert second.stored[0].source_sha256 == first.stored[0].source_sha256
+
+
+@pytest.mark.asyncio
 async def test_collector_rejects_symlink_library_ancestor_before_empty_shelf_mutation(
     tmp_path: Path,
 ):

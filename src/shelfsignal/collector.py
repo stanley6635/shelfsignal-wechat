@@ -4,6 +4,7 @@ import os
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from .content import (
     atomic_write,
@@ -119,10 +120,12 @@ async def _collect_one(
             else:
                 if (
                     existing.article.article_id != article.article_id
-                    or existing.article.source_url != article.source_url
+                    or _source_identity(existing.article.source_url)
+                    != _source_identity(article.source_url)
                 ):
                     raise ContentContractUnavailable(
-                        "stored article identity conflicts with remote article"
+                        "stored article identity conflicts with remote article: "
+                        f"{article.article_id} ({article.account_name})"
                     )
         remote_content = await client.content(article)
         if existing is not None and existing.status is ArticleStatus.COMPLETE:
@@ -244,6 +247,24 @@ def _article_sort_key(article: RemoteArticle) -> tuple[str, str]:
 def _failure_reason(exc: Exception) -> str:
     reason = " ".join(str(exc).split()) or type(exc).__name__
     return reason[:_MAX_REASON_LENGTH]
+
+
+def _source_identity(source_url: str) -> tuple[str, ...]:
+    normalized = source_url.replace(r"\u0026", "&").replace(r"\x26", "&")
+    try:
+        parsed = urlsplit(normalized)
+    except ValueError:
+        return ("url", normalized)
+    if (
+        parsed.scheme == "https"
+        and parsed.netloc == "mp.weixin.qq.com"
+        and parsed.path == "/s"
+    ):
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        identity = tuple(query.get(key, []) for key in ("__biz", "mid", "idx"))
+        if all(len(values) == 1 and values[0] for values in identity):
+            return ("wechat", *(values[0] for values in identity))
+    return ("url", normalized)
 
 
 def _metadata(
