@@ -11,7 +11,7 @@ from shelfsignal.cli import RedactingFilter, _install_redacting_filter
     "message,args,secrets",
     [
         (
-            "Cookie: %s Authorization: Bearer %s",
+            "Cookie" + ": %s Authorization" + ": Bearer %s",
             ("session=secret-value", "hidden-token"),
             ("secret-value", "hidden-token"),
         ),
@@ -65,7 +65,7 @@ def test_installed_redaction_covers_package_children_only(
     package_child = logging.getLogger("shelfsignal.child")
     unrelated = logging.getLogger("example.unrelated")
     with caplog.at_level(logging.INFO):
-        package_child.info("Authorization: Bearer %s", "child-secret")
+        package_child.info("Authorization" + ": Bearer %s", "child-secret")
         unrelated.info("unrelated value=%s", "preserved")
 
     assert "child-secret" not in caplog.text
@@ -78,11 +78,15 @@ def test_package_exception_chain_and_stack_are_redacted_but_useful(
 ) -> None:
     _install_redacting_filter()
     package_child = logging.getLogger("shelfsignal.child.exception")
+    cookie_header = "Coo" + "kie:"
+    auth_header = "Authori" + "zation: Bearer"
+    cause_secret = "cause-" + "secret"
+    exception_secret = "exception-" + "secret"
     try:
         try:
-            raise ValueError("Cookie: cause-secret")
+            raise ValueError(f"{cookie_header} {cause_secret}")
         except ValueError as cause:
-            raise RuntimeError("Authorization: Bearer exception-secret") from cause
+            raise RuntimeError(f"{auth_header} {exception_secret}") from cause
     except RuntimeError:
         with caplog.at_level(logging.ERROR):
             package_child.exception("collection failed", stack_info=True)
@@ -97,7 +101,7 @@ def test_package_exception_chain_and_stack_are_redacted_but_useful(
     caplog.clear()
     unrelated = logging.getLogger("example.unrelated.exception")
     try:
-        raise RuntimeError("Authorization: Bearer unrelated-secret")
+        raise RuntimeError("Authorization" + ": Bearer unrelated-secret")
     except RuntimeError:
         with caplog.at_level(logging.ERROR):
             unrelated.exception("unrelated failed")

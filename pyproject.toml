@@ -6,6 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "shelfsignal-wechat"
 version = "0.1.0"
 description = "Local-first WeChat Official Account article collector and Markdown briefing tool"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
   "playwright>=1.50,<2",

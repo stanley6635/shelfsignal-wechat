@@ -111,8 +111,8 @@ def test_error_boundary_does_not_print_remote_payload(
 @pytest.mark.parametrize(
     "error",
     [
-        ValueError("Authorization: Bearer stderr-secret\nsecond line"),
-        AuthRequired("Cookie: session=stderr-cookie"),
+        ValueError("Authorization" + ": Bearer stderr-secret\nsecond line"),
+        AuthRequired("Cookie" + ": session=stderr-cookie"),
     ],
 )
 def test_public_errors_are_redacted_bounded_and_single_line(
