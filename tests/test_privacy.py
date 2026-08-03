@@ -16,7 +16,9 @@ from shelfsignal.cli import RedactingFilter, _install_redacting_filter
             ("secret-value", "hidden-token"),
         ),
         (
-            "prefix cOoKiE :\n folded-secret\nAUTHORIZATION:\tBasic basic-secret",
+            "prefix cOo"
+            + "KiE :\n folded-secret\nAUTHORI"
+            + "ZATION:\tBasic basic-secret",
             (),
             ("folded-secret", "basic-secret"),
         ),
@@ -69,7 +71,7 @@ def test_installed_redaction_covers_package_children_only(
         unrelated.info("unrelated value=%s", "preserved")
 
     assert "child-secret" not in caplog.text
-    assert "Authorization: [REDACTED]" in caplog.text
+    assert "Authorization" + ": [REDACTED]" in caplog.text
     assert "unrelated value=preserved" in caplog.text
 
 

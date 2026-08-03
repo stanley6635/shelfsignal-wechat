@@ -80,6 +80,7 @@ def _write_synthetic_wheel(path: Path, unsafe: bytes | None = None) -> None:
     members = {
         "shelfsignal/__init__.py": b"",
         "shelfsignal/resources/vision_ocr.swift": b"import Vision\n",
+        "example.dist-info/METADATA": b"Metadata-Version: 2.4\nLicense-Expression: MIT\n",
         "example.dist-info/licenses/LICENSE": b"MIT License\n",
     }
     if unsafe is not None:
@@ -92,6 +93,7 @@ def _write_synthetic_wheel(path: Path, unsafe: bytes | None = None) -> None:
 def _write_synthetic_sdist(path: Path, unsafe_name: str | None = None) -> None:
     members = {
         "example-0.1.0/LICENSE": b"MIT License\n",
+        "example-0.1.0/PKG-INFO": b"Metadata-Version: 2.4\nLicense-Expression: MIT\n",
         "example-0.1.0/README.md": b"# Example\n",
         "example-0.1.0/pyproject.toml": b"[project]\n",
         "example-0.1.0/src/shelfsignal/__init__.py": b"",
@@ -119,8 +121,39 @@ def test_archive_audit_handles_binary_bytes_and_member_names(tmp_path: Path) -> 
     _write_synthetic_wheel(wheel, unsafe=private_root)
     assert any("forbidden marker" in item for item in audit_distribution(wheel))
 
+    credential_headers = (
+        b"cOo" + b"KiE\t: session=value",
+        b"authori" + b"zation: Basic dXNlcjpwYXNz",
+        b"AUTHORI" + b"ZATION : Bearer token-value",
+    )
+    for credential_header in credential_headers:
+        _write_synthetic_wheel(wheel, unsafe=credential_header)
+        assert any("header" in item for item in audit_distribution(wheel))
+
     _write_synthetic_sdist(sdist, "example-0.1.0/browser/session.bin")
     assert any("runtime or credential" in item for item in audit_distribution(sdist))
+
+
+def test_repository_audit_detects_case_insensitive_headers_without_word_false_positives(
+    tmp_path: Path,
+) -> None:
+    safe = tmp_path / "safe"
+    safe.mkdir()
+    (safe / "notes.bin").write_bytes(
+        b"cookie policy; authorization model; bearer market; basic access"
+    )
+    assert audit_repository(safe) == ()
+
+    credential_headers = (
+        b"coo" + b"kie: session=value",
+        b"AuThOrI" + b"zAtIoN:\tBasic dXNlcjpwYXNz",
+        b"authori" + b"zation :  Bearer token-value",
+    )
+    for index, credential_header in enumerate(credential_headers):
+        path = safe / f"secret-{index}.bin"
+        path.write_bytes(b"\x00\xff" + credential_header)
+        assert any("header" in item for item in audit_repository(safe))
+        path.unlink()
 
 
 def test_built_distribution_archives_pass_release_audit() -> None:

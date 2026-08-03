@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import stat
 import subprocess
 import tarfile
@@ -9,10 +10,13 @@ from pathlib import Path, PurePosixPath
 
 FORBIDDEN_BYTE_MARKERS = (
     b"/" + b"Users" + b"/",
-    b"Coo" + b"kie:",
-    b"Authori" + b"zation: Bearer",
     b"T" + b"ARS",
     b"Stan" + b"ley Sun",
+)
+COOKIE_HEADER = re.compile(br"\bcoo" br"kie\s*:", re.IGNORECASE)
+AUTHORIZATION_HEADER = re.compile(
+    br"\bauthori" br"zation\s*:\s*\S+\s+\S+",
+    re.IGNORECASE,
 )
 EXCLUDED_FALLBACK_PARTS = {
     ".git",
@@ -53,6 +57,15 @@ MAX_ARCHIVE_BYTES = 512 * 1024 * 1024
 
 def _forbidden_markers(value: bytes) -> tuple[bytes, ...]:
     return tuple(marker for marker in FORBIDDEN_BYTE_MARKERS if marker in value)
+
+
+def _credential_headers(value: bytes) -> tuple[str, ...]:
+    findings = []
+    if COOKIE_HEADER.search(value):
+        findings.append("cookie header")
+    if AUTHORIZATION_HEADER.search(value):
+        findings.append("authorization header")
+    return tuple(findings)
 
 
 def _unsafe_runtime_path(name: str) -> bool:
@@ -103,6 +116,8 @@ def audit_repository(root: Path) -> tuple[str, ...]:
         encoded_name = os.fsencode(relative.as_posix())
         for marker in _forbidden_markers(encoded_name):
             violations.append(f"forbidden marker {marker!r} in tracked filename {relative}")
+        for header in _credential_headers(encoded_name):
+            violations.append(f"{header} in tracked filename {relative}")
         if _unsafe_runtime_path(relative.as_posix()):
             violations.append(f"tracked runtime or credential artifact: {relative}")
 
@@ -122,6 +137,8 @@ def audit_repository(root: Path) -> tuple[str, ...]:
             continue
         for marker in _forbidden_markers(content):
             violations.append(f"forbidden marker {marker!r} in tracked file {relative}")
+        for header in _credential_headers(content):
+            violations.append(f"{header} in tracked file {relative}")
     return tuple(violations)
 
 
@@ -133,15 +150,20 @@ def _audit_member(
     encoded_name = name.encode("utf-8", errors="surrogateescape")
     for marker in _forbidden_markers(encoded_name):
         violations.append(f"forbidden marker {marker!r} in archive member name {name}")
+    for header in _credential_headers(encoded_name):
+        violations.append(f"{header} in archive member name {name}")
     if _unsafe_runtime_path(name):
         violations.append(f"runtime or credential artifact in archive: {name}")
     if content is not None:
         for marker in _forbidden_markers(content):
             violations.append(f"forbidden marker {marker!r} in archive member {name}")
+        for header in _credential_headers(content):
+            violations.append(f"{header} in archive member {name}")
 
 
-def _audit_zip(path: Path, violations: list[str]) -> set[str]:
+def _audit_zip(path: Path, violations: list[str]) -> tuple[set[str], bytes | None]:
     names: set[str] = set()
+    metadata = None
     total = 0
     with zipfile.ZipFile(path) as archive:
         for item in archive.infolist():
@@ -160,12 +182,16 @@ def _audit_zip(path: Path, violations: list[str]) -> set[str]:
             if total > MAX_ARCHIVE_BYTES:
                 violations.append("archive uncompressed size exceeds release limit")
                 break
-            _audit_member(item.filename, archive.read(item), violations)
-    return names
+            content = archive.read(item)
+            _audit_member(item.filename, content, violations)
+            if item.filename.endswith(".dist-info/METADATA"):
+                metadata = content
+    return names, metadata
 
 
-def _audit_tar(path: Path, violations: list[str]) -> set[str]:
+def _audit_tar(path: Path, violations: list[str]) -> tuple[set[str], bytes | None]:
     names: set[str] = set()
+    metadata = None
     total = 0
     with tarfile.open(path, "r:gz") as archive:
         for item in archive.getmembers():
@@ -187,23 +213,28 @@ def _audit_tar(path: Path, violations: list[str]) -> set[str]:
             if extracted is None:
                 violations.append(f"unreadable archive member: {item.name}")
                 continue
-            _audit_member(item.name, extracted.read(), violations)
-    return names
+            content = extracted.read()
+            _audit_member(item.name, content, violations)
+            if item.name.endswith("/PKG-INFO"):
+                metadata = content
+    return names, metadata
 
 
 def audit_distribution(path: Path) -> tuple[str, ...]:
     violations: list[str] = []
     if path.suffix == ".whl":
-        names = _audit_zip(path, violations)
+        names, metadata = _audit_zip(path, violations)
         required_suffixes = {
             "shelfsignal/__init__.py",
             "shelfsignal/resources/vision_ocr.swift",
+            ".dist-info/METADATA",
             ".dist-info/licenses/LICENSE",
         }
     elif path.name.endswith(".tar.gz"):
-        names = _audit_tar(path, violations)
+        names, metadata = _audit_tar(path, violations)
         required_suffixes = {
             "/LICENSE",
+            "/PKG-INFO",
             "/README.md",
             "/pyproject.toml",
             "/src/shelfsignal/__init__.py",
@@ -216,4 +247,6 @@ def audit_distribution(path: Path) -> tuple[str, ...]:
     for required in required_suffixes:
         if not any(name == required or name.endswith(required) for name in names):
             violations.append(f"required release member is missing: {required}")
+    if metadata is None or b"License-Expression: MIT" not in metadata:
+        violations.append("distribution metadata is missing License-Expression: MIT")
     return tuple(violations)
