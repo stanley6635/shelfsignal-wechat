@@ -1,0 +1,4 @@
+interface:
+  display_name: "ShelfSignal for WeChat"
+  short_description: "Collect and rank WeChat articles locally"
+  default_prompt: "Use $shelfsignal-wechat to generate my latest WeChat briefing."
