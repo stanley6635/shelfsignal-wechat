@@ -502,6 +502,9 @@ class FakePage:
     async def goto(self, url, **kwargs):
         return self.response
 
+    async def wait_for_selector(self, selector, **kwargs):
+        return object()
+
     async def content(self):
         return '<a data-book-type="official-account" data-book-id="account-1"><span class="title">Example</span></a>'
 

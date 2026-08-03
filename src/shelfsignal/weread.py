@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime
 from html.parser import HTMLParser
 from typing import Protocol
 from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, Page
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 
 from .content import _safe_https_url
 from .errors import (
@@ -21,6 +23,28 @@ SHELF_URL = "https://weread.qq.com/web/shelf"
 BOOK_READ_URL = "https://weread.qq.com/web/book/read"
 MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
 MAX_ASSET_BYTES = 25 * 1024 * 1024
+SHELF_RENDER_TIMEOUT_MS = 30_000
+SHELF_ACCOUNT_SELECTOR = (
+    'a[data-book-type="official-account"], '
+    'a.shelfBook[href*="/web/mp/reader/"]:not(.shelfBook_add)'
+)
+_ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_VOID_HTML_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
 
 _MIME_KINDS = {
     "image/avif": {"avif"},
@@ -80,6 +104,20 @@ class PlaywrightWeReadClient:
             raise AuthRequired("WeRead authorization is required")
         if not ok:
             raise ShelfUnavailable(f"saved shelf request failed: HTTP {status}")
+        try:
+            await self.page.wait_for_selector(
+                SHELF_ACCOUNT_SELECTOR,
+                state="attached",
+                timeout=SHELF_RENDER_TIMEOUT_MS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except PlaywrightTimeoutError as exc:
+            raise ShelfUnavailable(
+                "saved official-account shelf is empty or unreadable"
+            ) from exc
+        except Exception as exc:
+            raise ShelfUnavailable("saved shelf could not finish rendering") from exc
         try:
             html = await self.page.content()
         except asyncio.CancelledError:
@@ -243,49 +281,50 @@ class _ShelfParser(HTMLParser):
         self.accounts: list[ShelfAccount] = []
         self._account_id: str | None = None
         self._title_chunks: list[str] = []
-        self._title_span_nesting: int | None = None
+        self._title_nesting: int | None = None
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         values = dict(attrs)
-        if (
-            tag == "a"
-            and self._account_id is None
-            and values.get("data-book-type") == "official-account"
-        ):
-            raw_account_id = values.get("data-book-id")
-            account_id = (
-                raw_account_id.strip() if isinstance(raw_account_id, str) else ""
-            )
+        if tag == "a" and self._account_id is None:
+            account_id = ""
+            if values.get("data-book-type") == "official-account":
+                raw_account_id = values.get("data-book-id")
+                account_id = (
+                    raw_account_id.strip()
+                    if isinstance(raw_account_id, str)
+                    else ""
+                )
+            elif "shelfBook" in (values.get("class") or "").split():
+                account_id = _account_id_from_shelf_link(values.get("href")) or ""
             if account_id:
                 self._account_id = account_id
-        elif self._title_span_nesting is not None and tag == "span":
-            self._title_span_nesting += 1
+        elif self._title_nesting is not None and tag not in _VOID_HTML_TAGS:
+            self._title_nesting += 1
         elif (
             self._account_id
-            and self._title_span_nesting is None
-            and tag == "span"
+            and self._title_nesting is None
             and "title" in (values.get("class") or "").split()
         ):
             self._title_chunks = []
-            self._title_span_nesting = 1
+            self._title_nesting = 1
 
     def handle_data(self, data: str) -> None:
-        if self._title_span_nesting is not None:
+        if self._title_nesting is not None:
             self._title_chunks.append(data)
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "span" and self._title_span_nesting is not None:
-            self._title_span_nesting -= 1
-            if self._title_span_nesting == 0:
+        if tag not in _VOID_HTML_TAGS and self._title_nesting is not None:
+            self._title_nesting -= 1
+            if self._title_nesting == 0:
                 name = " ".join("".join(self._title_chunks).split())
                 if self._account_id and name:
                     self.accounts.append(ShelfAccount(self._account_id, name))
                 self._title_chunks = []
-                self._title_span_nesting = None
+                self._title_nesting = None
         if tag == "a":
             self._account_id = None
             self._title_chunks = []
-            self._title_span_nesting = None
+            self._title_nesting = None
 
 
 def parse_shelf_html(html: str) -> tuple[ShelfAccount, ...]:
@@ -295,6 +334,26 @@ def parse_shelf_html(html: str) -> tuple[ShelfAccount, ...]:
         raise ShelfUnavailable("saved official-account shelf is empty or unreadable")
     unique = {item.account_id: item for item in parser.accounts}
     return tuple(unique[key] for key in sorted(unique))
+
+
+def _account_id_from_shelf_link(href: str | None) -> str | None:
+    if not isinstance(href, str):
+        return None
+    try:
+        parsed = urlsplit(href.strip())
+    except ValueError:
+        return None
+    if (parsed.scheme or parsed.netloc) and (
+        parsed.scheme != "https" or parsed.netloc != "weread.qq.com"
+    ):
+        return None
+    prefix = "/web/mp/reader/"
+    if parsed.query or parsed.fragment or parsed.path.count("/") != prefix.count("/"):
+        return None
+    if not parsed.path.startswith(prefix):
+        return None
+    account_id = parsed.path.removeprefix(prefix)
+    return account_id if _ACCOUNT_ID_PATTERN.fullmatch(account_id) else None
 
 
 def parse_article_content(payload: object) -> ArticleContent:

@@ -19,6 +19,9 @@ from .errors import AuthRequired, ShelfUnavailable
 SHELF_URL = "https://weread.qq.com/web/shelf"
 AUTHORIZATION_TIMEOUT_MS = 180_000
 AUTH_POLL_INTERVAL_MS = 1_000
+EMBEDDED_LOGIN_SELECTOR = ".navBar_link_Login"
+EMBEDDED_QR_SELECTOR = 'iframe[src*="/connect/qrconnect"]'
+EMBEDDED_QR_TIMEOUT_MS = 15_000
 _SAFE_RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 
 
@@ -226,6 +229,54 @@ async def _probe_shelf(page):
     return page.url, response.status
 
 
+async def _embedded_login_visible(page) -> bool:
+    locator_factory = getattr(page, "locator", None)
+    if not callable(locator_factory):
+        return False
+    locator = locator_factory(EMBEDDED_LOGIN_SELECTOR)
+    count = await _await_playwright_phase(
+        locator.count(),
+        unavailable_message="WeRead login control could not be inspected",
+    )
+    if count == 0:
+        return False
+    return bool(
+        await _await_playwright_phase(
+            locator.first.is_visible(),
+            unavailable_message="WeRead login control could not be inspected",
+        )
+    )
+
+
+async def _complete_embedded_login(page) -> None:
+    await _await_playwright_phase(
+        page.wait_for_load_state("networkidle"),
+        unavailable_message="WeRead login page did not become ready",
+    )
+    locator = page.locator(EMBEDDED_LOGIN_SELECTOR).first
+    await _await_playwright_phase(
+        locator.click(),
+        unavailable_message="WeRead login control could not be opened",
+    )
+    await _await_playwright_phase(
+        page.wait_for_selector(
+            EMBEDDED_QR_SELECTOR,
+            state="visible",
+            timeout=EMBEDDED_QR_TIMEOUT_MS,
+        ),
+        unavailable_message="WeRead QR control did not appear",
+    )
+    await _await_playwright_phase(
+        page.wait_for_selector(
+            EMBEDDED_LOGIN_SELECTOR,
+            state="hidden",
+            timeout=AUTHORIZATION_TIMEOUT_MS - AUTH_POLL_INTERVAL_MS,
+        ),
+        unavailable_message="WeRead authorization page became unavailable",
+        qr_timeout=True,
+    )
+
+
 async def _await_playwright_phase(
     operation,
     *,
@@ -320,7 +371,8 @@ async def authenticated_context(
                 )
             )
             url, status = await _probe_shelf(page)
-            if is_auth_required(url, status):
+            embedded_login = await _embedded_login_visible(page)
+            if is_auth_required(url, status) or embedded_login:
                 try:
                     async with asyncio.timeout(AUTHORIZATION_TIMEOUT_MS / 1_000):
                         if _trusted_probe_path(url) == "/web/login":
@@ -332,9 +384,13 @@ async def authenticated_context(
                                 unavailable_message="WeRead authorization page became unavailable",
                                 qr_timeout=True,
                             )
+                        elif embedded_login:
+                            await _complete_embedded_login(page)
                         while True:
                             url, status = await _probe_shelf(page)
-                            if not is_auth_required(url, status):
+                            if not is_auth_required(
+                                url, status
+                            ) and not await _embedded_login_visible(page):
                                 break
                             await _await_playwright_phase(
                                 page.wait_for_timeout(AUTH_POLL_INTERVAL_MS),

@@ -321,6 +321,47 @@ async def test_authenticated_context_reprobes_after_successful_login(tmp_path, m
 
 
 @pytest.mark.asyncio
+async def test_authenticated_context_handles_embedded_login_on_shelf(
+    tmp_path, monkeypatch
+):
+    locator = SimpleNamespace(
+        count=AsyncMock(return_value=1),
+        is_visible=AsyncMock(side_effect=[True, False]),
+        click=AsyncMock(),
+    )
+    locator.first = locator
+    page = SimpleNamespace(
+        url=auth_module.SHELF_URL,
+        goto=AsyncMock(
+            side_effect=[SimpleNamespace(status=200), SimpleNamespace(status=200)]
+        ),
+        locator=lambda selector: locator,
+        wait_for_load_state=AsyncMock(),
+        wait_for_selector=AsyncMock(),
+        wait_for_url=AsyncMock(),
+        wait_for_timeout=AsyncMock(),
+    )
+    context, _ = install_mock_playwright(monkeypatch, page)
+
+    async with authenticated_context(
+        tmp_path / "browser", "run-001", AuthPolicy.FRESH
+    ):
+        pass
+
+    locator.click.assert_awaited_once_with()
+    page.wait_for_load_state.assert_awaited_once_with("networkidle")
+    assert page.wait_for_selector.await_args_list == [
+        ((auth_module.EMBEDDED_QR_SELECTOR,), {"state": "visible", "timeout": 15_000}),
+        (
+            (auth_module.EMBEDDED_LOGIN_SELECTOR,),
+            {"state": "hidden", "timeout": 179_000},
+        ),
+    ]
+    assert page.goto.await_count == 2
+    context.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
 async def test_authenticated_context_same_url_403_never_passes_without_reprobe(
     tmp_path, monkeypatch
 ):

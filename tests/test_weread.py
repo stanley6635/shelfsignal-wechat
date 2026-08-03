@@ -33,6 +33,41 @@ def test_parse_shelf_html_accumulates_nested_title_and_matches_class_tokens():
 
 
 @pytest.mark.parametrize(
+    "href",
+    [
+        "/web/mp/reader/MP_DEMO_ACCOUNT",
+        "https://weread.qq.com/web/mp/reader/MP_DEMO_ACCOUNT",
+    ],
+)
+def test_parse_shelf_html_accepts_current_shelf_book_links(href):
+    accounts = parse_shelf_html(
+        f'<a class="card shelfBook" href="{href}">'
+        '<div class="title" title="Example Account">'
+        'Example <em>Account</em><br></div></a>'
+    )
+
+    assert accounts == (ShelfAccount("MP_DEMO_ACCOUNT", "Example Account"),)
+
+
+@pytest.mark.parametrize(
+    "href",
+    [
+        "/web/mp/reader/",
+        "/web/mp/reader/account/extra",
+        "/web/mp/reader/account?unexpected=1",
+        "/web/mp/reader/account#unexpected",
+        "https://evil.invalid/web/mp/reader/account",
+    ],
+)
+def test_parse_shelf_html_rejects_untrusted_or_ambiguous_shelf_links(href):
+    with pytest.raises(ShelfUnavailable, match="empty or unreadable"):
+        parse_shelf_html(
+            f'<a class="shelfBook" href="{href}">'
+            '<span class="title">Example Account</span></a>'
+        )
+
+
+@pytest.mark.parametrize(
     "html",
     [
         (
