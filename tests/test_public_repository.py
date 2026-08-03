@@ -1,34 +1,22 @@
 from __future__ import annotations
 
+import io
+import os
+import tarfile
 import tomllib
+import zipfile
 from pathlib import Path
 
+import pytest
+from release_audit import audit_distribution, audit_repository, repository_files
+
 ROOT = Path(__file__).parents[1]
-TEXT_SUFFIXES = {".py", ".md", ".toml", ".yaml", ".yml", ".gitignore"}
-EXCLUDED_PARTS = {".git", ".venv", "dist", "build", ".build"}
 
 
-def public_text_files():
-    for path in ROOT.rglob("*"):
-        if not path.is_file() or any(part in EXCLUDED_PARTS for part in path.parts):
-            continue
-        if path.suffix in TEXT_SUFFIXES or path.name == ".gitignore":
-            yield path
-
-
-def test_public_repository_has_no_private_paths_or_credentials() -> None:
-    private_user_root = "/" + "Users" + "/"
-    cookie_header = "Coo" + "kie:"
-    bearer_header = "Authori" + "zation: Bearer"
-    private_project = "T" + "ARS"
-    maintainer_name = "Stan" + "ley Sun"
-    for path in public_text_files():
-        text = path.read_text(encoding="utf-8", errors="ignore")
-        assert private_user_root not in text, path
-        assert cookie_header not in text, path
-        assert bearer_header not in text, path
-        assert private_project not in text, path
-        assert maintainer_name not in text, path
+def test_public_repository_has_no_private_or_runtime_artifacts() -> None:
+    files = repository_files(ROOT)
+    assert files
+    assert audit_repository(ROOT) == ()
 
 
 def test_readme_documents_the_complete_public_workflow() -> None:
@@ -38,6 +26,9 @@ def test_readme_documents_the_complete_public_workflow() -> None:
         "Python 3.11",
         "playwright install chromium",
         "global Skill",
+        'export SHELFSIGNAL_WORKSPACE="$HOME/ShelfSignal-Data"',
+        "current shell",
+        "outside any Git repository",
         "profile/interests.md",
         "profile/rubric.md",
         "profile/focus/",
@@ -56,6 +47,8 @@ def test_readme_documents_the_complete_public_workflow() -> None:
         "no LLM provider API",
         "shelfsignal doctor",
         "v0 non-goals",
+        "MIT License",
+        "SHELFSIGNAL_REQUIRE_DIST=1 python -m pytest -q tests/test_public_repository.py",
     )
     for claim in required_claims:
         assert claim in readme, claim
@@ -71,20 +64,70 @@ def test_package_metadata_and_shipped_resources_are_public_ready() -> None:
     project = config["project"]
     assert project["name"] == "shelfsignal-wechat"
     assert project["readme"] == "README.md"
+    assert project["license"] == "MIT"
+    assert project["license-files"] == ["LICENSE"]
     assert project["requires-python"] == ">=3.11"
     assert project["scripts"]["shelfsignal"] == "shelfsignal.cli:console_main"
     assert config["tool"]["setuptools"]["package-data"]["shelfsignal"] == [
         "resources/*.swift"
     ]
+    assert (ROOT / "LICENSE").read_text(encoding="utf-8").startswith("MIT License\n")
     assert (ROOT / "src/shelfsignal/resources/vision_ocr.swift").is_file()
     assert (ROOT / "skills/shelfsignal-wechat/SKILL.md").is_file()
 
 
-def test_repository_has_no_runtime_artifacts() -> None:
-    forbidden_names = {"state.db", "Cookies", "Local State"}
-    forbidden_suffixes = {".sqlite", ".sqlite3"}
-    for path in ROOT.rglob("*"):
-        if any(part in EXCLUDED_PARTS for part in path.parts):
-            continue
-        assert path.name not in forbidden_names, path
-        assert path.suffix not in forbidden_suffixes, path
+def _write_synthetic_wheel(path: Path, unsafe: bytes | None = None) -> None:
+    members = {
+        "shelfsignal/__init__.py": b"",
+        "shelfsignal/resources/vision_ocr.swift": b"import Vision\n",
+        "example.dist-info/licenses/LICENSE": b"MIT License\n",
+    }
+    if unsafe is not None:
+        members["shelfsignal/binary.bin"] = b"\x00\xff" + unsafe
+    with zipfile.ZipFile(path, "w") as archive:
+        for name, content in members.items():
+            archive.writestr(name, content)
+
+
+def _write_synthetic_sdist(path: Path, unsafe_name: str | None = None) -> None:
+    members = {
+        "example-0.1.0/LICENSE": b"MIT License\n",
+        "example-0.1.0/README.md": b"# Example\n",
+        "example-0.1.0/pyproject.toml": b"[project]\n",
+        "example-0.1.0/src/shelfsignal/__init__.py": b"",
+        "example-0.1.0/src/shelfsignal/resources/vision_ocr.swift": b"import Vision\n",
+        "example-0.1.0/tests/release_audit.py": b"# release audit\n",
+    }
+    if unsafe_name is not None:
+        members[unsafe_name] = b"private"
+    with tarfile.open(path, "w:gz") as archive:
+        for name, content in members.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(content)
+            archive.addfile(info, io.BytesIO(content))
+
+
+def test_archive_audit_handles_binary_bytes_and_member_names(tmp_path: Path) -> None:
+    wheel = tmp_path / "example-0.1.0-py3-none-any.whl"
+    sdist = tmp_path / "example-0.1.0.tar.gz"
+    _write_synthetic_wheel(wheel)
+    _write_synthetic_sdist(sdist)
+    assert audit_distribution(wheel) == ()
+    assert audit_distribution(sdist) == ()
+
+    private_root = b"/" + b"Users" + b"/private"
+    _write_synthetic_wheel(wheel, unsafe=private_root)
+    assert any("forbidden marker" in item for item in audit_distribution(wheel))
+
+    _write_synthetic_sdist(sdist, "example-0.1.0/browser/session.bin")
+    assert any("runtime or credential" in item for item in audit_distribution(sdist))
+
+
+def test_built_distribution_archives_pass_release_audit() -> None:
+    if os.environ.get("SHELFSIGNAL_REQUIRE_DIST") != "1":
+        pytest.skip("set SHELFSIGNAL_REQUIRE_DIST=1 for the built-artifact release gate")
+    archives = sorted((ROOT / "dist").glob("shelfsignal_wechat-0.1.0*"))
+    assert {path.suffix for path in archives} >= {".whl", ".gz"}
+    assert len(archives) == 2
+    for archive in archives:
+        assert audit_distribution(archive) == (), archive

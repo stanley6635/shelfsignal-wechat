@@ -38,12 +38,19 @@ source.
 
 ## Create the private runtime workspace
 
-Choose a private location outside any Git repository and initialize it once:
+Choose a private location outside any Git repository, set it in the current
+shell, and initialize it once:
 
 ```bash
+export SHELFSIGNAL_WORKSPACE="$HOME/ShelfSignal-Data"
 shelfsignal init "$SHELFSIGNAL_WORKSPACE"
 shelfsignal doctor --workspace "$SHELFSIGNAL_WORKSPACE"
 ```
+
+The exported variable applies to the current shell and child processes. Add an
+equivalent private setting to your shell configuration only if you want it in
+future shells. Do not point it inside a source checkout or another Git
+repository.
 
 `init` creates private browser state, article storage, run artifacts,
 briefings, exports, and a minimal SQLite ledger. It also creates editable
@@ -187,3 +194,15 @@ ShelfSignal v0 does not provide a GUI, web application, daemon, scheduler,
 Docker image, cloud sync, remote OCR, cross-platform OCR abstraction, built-in
 LLM calls, or direct writes into third-party knowledge systems. It is an
 inspectable macOS command-line collector plus a host-neutral local-agent Skill.
+
+## License
+
+ShelfSignal for WeChat is released under the [MIT License](LICENSE).
+
+For a release candidate, build both archives and run the artifact-aware public
+gate explicitly:
+
+```bash
+python -m build
+SHELFSIGNAL_REQUIRE_DIST=1 python -m pytest -q tests/test_public_repository.py
+```
