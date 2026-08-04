@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
 from html.parser import HTMLParser
 from typing import Protocol
@@ -26,6 +26,8 @@ from .models import ArticleContent, RemoteArticle, ShelfAccount
 SHELF_URL = "https://weread.qq.com/web/shelf"
 COVER_URL = "https://weread.qq.com/web/mp/cover"
 MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
+BOOKREAD_URL = "https://weread.qq.com/web/mp/articles"
+_LOOKBACK_TZ = timezone(timedelta(hours=8))
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_ARTICLE_HTML_BYTES = 25 * 1024 * 1024
 SHELF_RENDER_TIMEOUT_MS = 30_000
@@ -92,14 +94,12 @@ class _LatestSeed:
 
 
 class PlaywrightWeReadClient:
-    coverage_warning = (
-        "latest-only: WeRead exposes at most the current article for each saved account; "
-        "historical articles are not traversed"
-    )
+    coverage_warning = None
 
-    def __init__(self, context: BrowserContext, page: Page):
+    def __init__(self, context: BrowserContext, page: Page, *, lookback_days: int = 2):
         self.context = context
         self.page = page
+        self._lookback_days = lookback_days
         self._latest_by_account: dict[str, _LatestSeed] = {}
         self._content_by_article: dict[str, ArticleContent] = {}
         self._review_by_article: dict[str, str] = {}
@@ -137,7 +137,9 @@ class PlaywrightWeReadClient:
                 raise ContentContractUnavailable(
                     f"mp/cover returned HTTP {response.status}"
                 )
-            seed = parse_cover_payload(await _response_json(response, "mp/cover"), book_id)
+            payload = await _response_json(response, "mp/cover")
+            _reject_cover_rate_limit(payload, book_id)
+            seed = parse_cover_payload(payload, book_id)
             latest[book_id] = seed
             self._review_by_article[seed.article_id] = seed.review_id
         self._latest_by_account = latest
@@ -184,6 +186,102 @@ class PlaywrightWeReadClient:
         return dom_accounts, parse_cover_book_ids(resource_urls)
 
     async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
+        try:
+            articles = await self._articles_from_bookread(account)
+            if articles:
+                return articles
+        except AuthRequired:
+            raise
+        except Exception:
+            pass
+        return await self._articles_from_cover(account)
+
+    async def _articles_from_bookread(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
+        # Web (cookie-authenticated) article list API. The i.weread.qq.com
+        # /book/articles endpoint requires client-side skey/vid headers and
+        # returns -2012 (登录超时) for browser cookies, so the web API is
+        # used instead: GET /web/mp/articles?bookId=MP_WXS_xxx&offset=N
+        cutoff = _lookback_cutoff(self._lookback_days)
+        articles: list[RemoteArticle] = []
+        offset = 0
+        max_pages = 5  # up to 100 articles, more than enough for lookback window
+        while offset < max_pages * 20:
+            response = await self.context.request.get(
+                BOOKREAD_URL,
+                params={
+                    "bookId": account.account_id,
+                    "offset": str(offset),
+                },
+            )
+            _validate_api_response(response, "/web/mp/articles", "web/mp/articles")
+            if not response.ok:
+                raise ContentContractUnavailable(
+                    f"web/mp/articles returned HTTP {response.status}"
+                )
+            payload = await _response_json(response, "web/mp/articles")
+            reviews = payload.get("reviews")
+            if not isinstance(reviews, list) or not reviews:
+                break
+            page_has_recent = False
+            for item in reviews:
+                if not isinstance(item, dict):
+                    continue
+                sub_reviews = item.get("subReviews")
+                if not isinstance(sub_reviews, list) or not sub_reviews:
+                    continue
+                sub = sub_reviews[0]
+                if not isinstance(sub, dict):
+                    continue
+                review = sub.get("review")
+                if not isinstance(review, dict):
+                    continue
+                article_id = review.get("reviewId")
+                mp_info = review.get("mpInfo")
+                if not isinstance(mp_info, dict):
+                    continue
+                title = mp_info.get("title")
+                publish_time = mp_info.get("time")
+                if not isinstance(article_id, str) or not (article_id := article_id.strip()):
+                    continue
+                if not isinstance(title, str) or not (title := title.strip()):
+                    continue
+                if type(publish_time) is not int:
+                    continue
+                try:
+                    published_at = datetime.fromtimestamp(publish_time, tz=UTC)
+                except (OverflowError, OSError, ValueError):
+                    continue
+                if published_at >= cutoff:
+                    page_has_recent = True
+                else:
+                    # articles are in reverse chronological order;
+                    # once we pass the cutoff, stop this page
+                    continue
+                # mpInfo has no mp.weixin.qq.com URL; fetch content to
+                # resolve the real source URL for dedup.
+                source_url = ""
+                try:
+                    content = await self._fetch_content(article_id, article_id)
+                    _, source_url = parse_latest_html_metadata(content.html)
+                except Exception:
+                    source_url = ""
+                articles.append(RemoteArticle(
+                    article_id=article_id,
+                    account_id=account.account_id,
+                    account_name=account.name,
+                    title=title,
+                    source_url=source_url,
+                    published_at=published_at,
+                ))
+            if not page_has_recent and articles:
+                # all remaining pages are older than cutoff
+                break
+            if len(reviews) < 20:
+                break
+            offset += 20
+        return tuple(articles)
+
+    async def _articles_from_cover(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
         seed = self._latest_by_account.get(account.account_id)
         if seed is None:
             raise ContentContractUnavailable("latest cover is missing for shelf account")
@@ -350,7 +448,7 @@ def _trusted_path(
         raise error_type(message) from exc
     if (
         parsed.scheme != "https"
-        or parsed.netloc != "weread.qq.com"
+        or not (parsed.netloc == "weread.qq.com" or parsed.netloc.endswith(".weread.qq.com"))
         or parsed.path not in allowed_paths
     ):
         raise error_type(message)
@@ -420,6 +518,23 @@ def parse_cover_book_ids(resource_urls: object) -> tuple[str, ...]:
     if not book_ids:
         raise ShelfUnavailable("saved shelf did not expose readable cover responses")
     return tuple(sorted(book_ids))
+
+
+def _reject_cover_rate_limit(payload: object, book_id: str) -> None:
+    """Fail loudly on WeRead rate limiting instead of confusing parse errors.
+
+    WeRead's mp/cover endpoint returns errCode -2014 ("请求频率过高") when
+    the account is throttled. Without this check the payload would fail
+    parse_cover_payload with a misleading "account name is missing".
+    """
+    if not isinstance(payload, dict):
+        return
+    err_code = payload.get("errCode")
+    err_msg = payload.get("errMsg")
+    if err_code == -2014:
+        raise ContentContractUnavailable(
+            f"mp/cover rate limited for {book_id}: {err_msg}"
+        )
 
 
 def parse_cover_payload(payload: object, book_id: str) -> _LatestSeed:
@@ -609,6 +724,16 @@ def parse_article_content(payload: object) -> ArticleContent:
     if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
         raise ContentContractUnavailable("article image list has changed type")
     return ArticleContent(article_id, body, tuple(dict.fromkeys(images)))
+
+
+def _lookback_cutoff(lookback_days: int) -> datetime:
+    """Cutoff at the start of (today - lookback_days + 1) in Beijing time.
+
+    lookback_days=2 → yesterday 00:00 Beijing time → "前一天 0 点到今天".
+    """
+    now_local = datetime.now(_LOOKBACK_TZ)
+    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    return today_start - timedelta(days=max(lookback_days - 1, 0))
 
 
 def parse_book_read(

@@ -606,7 +606,7 @@ async def _collect_run_locked(
     try:
         async with authenticated_context(paths.browser_dir, run_id, auth_policy) as context:
             page = context.pages[0] if context.pages else await context.new_page()
-            client = PlaywrightWeReadClient(context, page)
+            client = PlaywrightWeReadClient(context, page, lookback_days=lookback_days)
             briefing = await process_client_run(
                 paths,
                 store,
