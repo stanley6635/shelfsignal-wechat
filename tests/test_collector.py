@@ -589,14 +589,16 @@ def test_cover_payload_builds_one_latest_seed():
     )
 
 
-def test_cover_payload_hashes_remote_id_that_is_unsafe_for_local_paths():
+def test_cover_payload_keeps_tilde_in_remote_id_now_that_paths_are_hashed():
+    # Path safety moved to hashed article dirs (article_dir_name); the
+    # article ID itself keeps its original characters (e.g. '~').
     seed = parse_cover_payload(
         {"name": "Account", "title": "Latest", "reviewId": "remote~review"},
         "book-1",
     )
     assert seed.review_id == "remote~review"
-    assert seed.article_id.startswith("review-")
-    assert "~" not in seed.article_id
+    assert seed.article_id == "remote~review"
+    assert "~" in seed.article_id
 
 
 @pytest.mark.parametrize(

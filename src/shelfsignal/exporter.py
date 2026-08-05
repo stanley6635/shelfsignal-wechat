@@ -10,12 +10,12 @@ import stat
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
-from .content import _load_metadata, ensure_safe_directory
+from .content import _load_metadata, article_dir_name, ensure_safe_directory
 from .weread import _raster_kind
 
 ALLOWED_FILES = ("source.md", "metadata.md", "ocr.md")
 
-_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}\Z")
 _SAFE_ASSET_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}\Z")
 _MARKDOWN_LINK = re.compile(r"!?\[[^\]\n]*\]\(([^)\n]+)\)")
 _MARKDOWN_REFERENCE = re.compile(r"(?m)^\s{0,3}\[[^\]\n]+\]:\s*(\S+)")
@@ -190,7 +190,7 @@ def _collect_article(
     plan: dict[PurePosixPath, bytes],
     total_bytes: int,
 ) -> int:
-    article_fd = _open_child_directory(library_fd, article_id, "article")
+    article_fd = _open_child_directory(library_fd, article_dir_name(article_id), "article")
     try:
         source = _read_regular_at(
             article_fd,

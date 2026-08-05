@@ -15,15 +15,15 @@ from urllib.parse import urlparse
 from .content import atomic_write
 from .models import ReadingCard
 
-_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
-_ID_LINE = re.compile(r"<!-- shelfsignal:id=([A-Za-z0-9][A-Za-z0-9_.:-]{0,127}) -->\Z")
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}\Z")
+_ID_LINE = re.compile(r"<!-- shelfsignal:id=([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}) -->\Z")
 _DIGEST_LINE = re.compile(r"<!-- shelfsignal:digest=([0-9a-f]{64}) -->\Z")
 _CHECK_LINE = re.compile(r"- \[([ xX])\] \*\*Select\*\*\Z")
 _MANIFEST_ITEM = re.compile(
-    r"- `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})` sha256:([0-9a-f]{64})\Z"
+    r"- `([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})` sha256:([0-9a-f]{64})\Z"
 )
-_RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})\Z")
-_ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:-]{0,127})`\Z")
+_RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})\Z")
+_ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})`\Z")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _MAX_CARDS = 2_000

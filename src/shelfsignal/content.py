@@ -44,7 +44,7 @@ _REQUIRED_METADATA_KEYS = {
     "status",
     "title",
 }
-_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}\Z")
 _APPROVED_IMAGE_HOSTS = {
     "mmbiz.qpic.cn",
     "mmbiz.qlogo.cn",
@@ -54,6 +54,16 @@ _APPROVED_IMAGE_HOSTS = {
     "wfqqreader-1252317822.image.myqcloud.com",
 }
 _RASTER_SUFFIXES = {".avif", ".bmp", ".gif", ".heic", ".jpeg", ".jpg", ".png", ".tif", ".tiff", ".webp"}
+
+
+def article_dir_name(article_id: str) -> str:
+    """Stable, filesystem-safe directory name derived from an article ID.
+
+    WeRead article IDs may contain characters outside a conservative safe set
+    (e.g. '~'), so the on-disk directory is named by a truncated SHA-256 digest
+    of the ID rather than the ID itself. The original ID remains in metadata.
+    """
+    return hashlib.sha256(article_id.encode("utf-8")).hexdigest()[:32]
 
 
 @dataclass(frozen=True)
@@ -265,11 +275,11 @@ def ensure_safe_directory(directory: Path, *, label: str = "collection") -> Path
 
 
 def safe_article_dir(library_dir: Path, article_id: str) -> Path:
-    if not _SAFE_ARTICLE_ID.fullmatch(article_id):
+    if not isinstance(article_id, str) or not article_id:
         raise ValueError("unsafe article ID")
     library_fd, library_dir = _open_directory(library_dir, "article")
     os.close(library_fd)
-    directory = library_dir / article_id
+    directory = library_dir / article_dir_name(article_id)
     descriptor, directory = _open_directory(directory, "article", create_final=True)
     os.close(descriptor)
     return directory
@@ -495,8 +505,8 @@ def load_stored_article(directory: Path) -> StoredArticle:
             raise ValueError("source hash mismatch")
         if not _SAFE_ARTICLE_ID.fullmatch(values["article_id"]):
             raise ValueError("invalid source article ID")
-        if values["article_id"] != directory.name:
-            raise ValueError("source article ID does not match directory")
+        if directory.name != article_dir_name(values["article_id"]):
+            raise ValueError("source article directory does not match article ID")
         try:
             published_at = datetime.fromisoformat(values["published_at"])
             status = ArticleStatus(values["status"])

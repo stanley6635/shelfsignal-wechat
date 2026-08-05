@@ -21,7 +21,7 @@ _MAX_STATUS_CHARACTERS = 256
 _MAX_CARDS = 2000
 _MAX_SERIALIZED_CARD_BYTES = 96 * 1024
 _MAX_ARTIFACT_BYTES = 16 * 1024 * 1024
-_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
+_SAFE_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}\Z")
 
 
 def _bounded_excerpt(text: str, limit: int) -> str:

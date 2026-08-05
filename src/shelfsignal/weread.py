@@ -36,7 +36,7 @@ SHELF_ACCOUNT_SELECTOR = (
     'a.shelfBook[href*="/web/mp/reader/"]:not(.shelfBook_add)'
 )
 _ACCOUNT_ID_PATTERN = re.compile(r"[A-Za-z0-9_-]{1,256}")
-_SAFE_LOCAL_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
+_SAFE_LOCAL_ARTICLE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}")
 _PUBLISH_TIME_PATTERN = re.compile(
     r"(?:\bct\b|\bpublish_time\b)\s*[:=]\s*['\"]?(\d{10})"
 )

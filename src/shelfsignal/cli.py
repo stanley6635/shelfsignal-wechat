@@ -30,7 +30,12 @@ from .briefing import (
 )
 from .cards import build_card, write_cards
 from .collector import MAX_LOOKBACK_DAYS, collect_articles
-from .content import atomic_write, ensure_safe_directory, load_stored_article
+from .content import (
+    atomic_write,
+    article_dir_name,
+    ensure_safe_directory,
+    load_stored_article,
+)
 from .errors import ShelfSignalError
 from .exporter import ExportError, export_selected
 from .models import ArticleStatus, CollectionOmission, StoredArticle
@@ -485,7 +490,7 @@ def prepare_run(paths: WorkspacePaths, store: StateStore, run_id: str) -> Path:
     run_dir = ensure_safe_directory(paths.runs_dir / run_id, label="run")
     warnings = _existing_warnings(paths, run_dir)
     stored = tuple(
-        load_stored_article(paths.library_dir / article_id)
+        load_stored_article(paths.library_dir / article_dir_name(article_id))
         for article_id in store.article_ids_for_run(run_id)
     )
     card_tuple = tuple(build_card(item) for item in stored)
