@@ -106,8 +106,7 @@ The following require explicit user approval before execution:
 - modifying secrets, tokens, `.env`, CI/CD, or release configuration;
 - changing the SQLite schema or migrating runtime data;
 - installing global dependencies or changing system configuration;
-- pushing, rebasing, force-pushing, publishing, deploying, or creating a public
-  release;
+- rebasing, force-pushing, publishing, deploying, or creating a public release;
 - expanding v0 into background automation, remote services, or direct writes
   into third-party knowledge systems.
 
@@ -118,6 +117,10 @@ work, write and approve a plan before implementation.
 
 - Keep commits scoped to the approved task.
 - Never stage unrelated changes.
+- For user-requested repository changes, completion includes a scoped commit
+  and push to `main` after validation unless the user explicitly asks to keep
+  the work local. This is the repository owner's standing authorization for a
+  normal non-force push; it does not authorize rebasing or force-pushing.
 - Use English for code, identifiers, commands, and public technical
   documentation unless a localized document is explicitly requested.
 - Run the smallest relevant tests during iteration and the full project quality

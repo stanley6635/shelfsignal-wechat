@@ -1,7 +1,7 @@
 <p align="center">
-  <img src="docs/assets/wechat-logo.png" alt="微信" height="48">
+  <img src="docs/assets/wechat-logo.png" alt="微信" width="200" align="middle">
   &nbsp;&nbsp;&nbsp;&nbsp;
-  <img src="docs/assets/weread-logo.png" alt="微信读书" height="48">
+  <img src="docs/assets/weread-logo.png" alt="微信读书" width="213" align="middle">
 </p>
 
 <h1 align="center">ShelfSignal for WeChat</h1>
