@@ -1,28 +1,56 @@
-# ShelfSignal for WeChat
+<p align="center">
+  <img src="docs/assets/wechat-logo.png" alt="微信" height="48">
+  &nbsp;&nbsp;&nbsp;&nbsp;
+  <img src="docs/assets/weread-logo.png" alt="微信读书" height="48">
+</p>
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+<h1 align="center">ShelfSignal for WeChat</h1>
 
-Local-first WeChat Official Account article collection for local AI agents.
+<p align="center"><strong>从微信读书书架采集微信公众号文章，生成可筛选、可交付的本地 Markdown 简报。</strong></p>
 
-ShelfSignal captures full text and meaningful images from an authenticated
-WeRead shelf, applies Apple Vision OCR to image-heavy posts, produces a
-complete interest-ranked Markdown briefing, and exports user-selected articles
-for the current local agent or knowledge system.
+<p align="center">
+  <strong>简体中文</strong> · <a href="README.en.md">English</a>
+</p>
 
-## Requirements
+<p align="center"><code>Local-first</code> · <code>全文与图片</code> · <code>本地 OCR</code> · <code>人工筛选</code> · <code>Agent-ready</code></p>
 
-- macOS with Apple Vision and the Xcode Command Line Tools (`swiftc` and
-  `sips`)
-- Python 3.11 or newer
-- a WeRead account whose shelf contains saved WeChat Official Account content
+> [!IMPORTANT]
+> ShelfSignal 是独立开源项目，与腾讯、微信及微信读书不存在官方关联。微信和微信读书名称及 Logo 的相关权利归其权利人所有。
 
-ShelfSignal v0 is macOS-only. Keep the source checkout separate from the
-private runtime workspace described below.
+## 它解决什么问题
 
-## Install
+微信公众号内容适合阅读，却不容易稳定地沉淀为本地资料。ShelfSignal 利用用户本人授权后的微信读书书架，把公众号文章转成一条短而清晰的本地工作流：采集完整内容、保留图片、必要时执行 OCR、生成全部候选简报，再由用户决定哪些文章值得交给当前 Agent 或知识库继续处理。
 
-Install the Python package in an isolated environment. For example, from a
-source checkout:
+它不内置 LLM，不替用户做最终选择，也不把私有内容上传到额外的云服务。
+
+## 核心能力
+
+| 能力 | ShelfSignal 的处理方式 |
+| --- | --- |
+| 微信公众号采集 | 从已授权的微信读书书架读取当前可见文章，保存正文与有效图片 |
+| 图片型文章 | 通过 macOS Apple Vision 在本地执行 OCR，派生文本不覆盖原始内容 |
+| 兴趣排序 | 本地 Agent 根据用户画像排序和摘要，但不隐藏候选、不自动勾选 |
+| 安全交付 | 仅导出用户选中的文章，不包含 Cookie、浏览器状态、画像或内部台账 |
+
+## 工作流程
+
+```text
+微信读书扫码授权 → 采集全部候选 → 本地 Agent 排序并生成简报 → 用户勾选 → 导出材料包
+```
+
+[快速开始](#快速开始) · [日常使用](#日常使用流程) · [隐私边界](#隐私边界) · [故障排查](#故障排查)
+
+## 运行要求
+
+- macOS，并已安装支持 Apple Vision 的系统环境和 Xcode Command Line Tools（需要 `swiftc` 与 `sips`）
+- Python 3.11 或更高版本
+- 微信读书账号，且书架中已保存微信公众号内容
+
+v0 仅支持 macOS。源码仓库和下文介绍的私有运行目录必须分开存放。
+
+## 快速开始
+
+建议把 Python 包安装在隔离环境中。以源码安装为例：
 
 ```bash
 python3.11 -m venv .venv
@@ -30,18 +58,13 @@ python3.11 -m venv .venv
 ./.venv/bin/python -m playwright install chromium
 ```
 
-Activate that environment or otherwise expose its `shelfsignal` executable to
-your local agent. The repository also ships the host-neutral Skill at
-`skills/shelfsignal-wechat/`. Install that directory as a global Skill through
-your host agent's standard Skill installation mechanism. The Skill and the
-Python package are separate: Python wheels contain the executable and Apple
-Vision helper, while the repository directory is the Skill installation
-source.
+使用时需要激活该环境，或通过其他方式让本地 Agent 能够调用 `shelfsignal`。仓库同时提供与宿主无关的 Skill：`skills/shelfsignal-wechat/`，可通过宿主 Agent 的标准安装方式注册为全局 Skill。
 
-## Create the private runtime workspace
+Skill 与 Python 包是两个独立部分：wheel 提供命令行程序和 Apple Vision 辅助工具，仓库中的 Skill 目录负责告诉本地 Agent 如何编排完整流程。
 
-Choose a private location outside any Git repository, set it in the current
-shell, and initialize it once:
+## 建立私有运行目录
+
+选择一个不属于任何 Git 仓库的私有位置，在当前 shell 中设置路径，并初始化一次：
 
 ```bash
 export SHELFSIGNAL_WORKSPACE="$HOME/ShelfSignal-Data"
@@ -49,27 +72,19 @@ shelfsignal init "$SHELFSIGNAL_WORKSPACE"
 shelfsignal doctor --workspace "$SHELFSIGNAL_WORKSPACE"
 ```
 
-The exported variable applies to the current shell and child processes. Add an
-equivalent private setting to your shell configuration only if you want it in
-future shells. Do not point it inside a source checkout or another Git
-repository.
+环境变量只对当前 shell 及其子进程生效。如果希望以后自动加载，可以自行写入 shell 配置；不要把运行目录放进 ShelfSignal 源码仓库或其他 Git 项目。
 
-`init` creates private browser state, article storage, run artifacts,
-briefings, exports, and a minimal SQLite ledger. It also creates editable
-Markdown profiles:
+`init` 会创建浏览器状态、文章库、运行记录、简报、导出目录和一份最小化的 SQLite 台账，同时生成可编辑的 Markdown 用户画像：
 
-- `profile/interests.md` for durable positive and negative interest signals;
-- `profile/rubric.md` for scoring guidance;
-- optional files under `profile/focus/` for a temporary focus on one run.
+- `profile/interests.md`：长期关注和明确不关注的方向；
+- `profile/rubric.md`：评分与判断标准；
+- `profile/focus/`：可选，用于某一次运行的临时关注重点。
 
-Profiles only guide ordering and confidence. They never hide candidates or
-preselect checkboxes, and the global Skill treats them as read-only unless the
-user explicitly approves a change.
+这些资料只影响排序、摘要角度和置信度，不会隐藏候选，也不会自动勾选文章。除非用户明确同意，Skill 只读取画像，不会修改它们。
 
-## Authentication and run lifecycle
+## 授权与运行周期
 
-The default policy is `fresh`. Start every new briefing with an explicit,
-unique run ID:
+默认认证策略是 `fresh`。每次生成新简报时，应使用一个明确且唯一的 run ID：
 
 ```bash
 shelfsignal collect \
@@ -79,29 +94,15 @@ shelfsignal collect \
   --lookback-days 7
 ```
 
-The WeRead v0 adapter is intentionally latest-only: it reads at most the
-current article exposed for each saved Official Account. `--lookback-days` is
-a freshness filter for those current articles; it does not request a historical
-list. Repeated runs use the local ledger to skip source URLs already collected.
+v0 的微信读书适配器采用 **latest-only** 策略：每个已保存公众号最多读取微信读书当前暴露的一篇文章，不承诺获取历史文章列表。`--lookback-days` 只判断当前文章是否仍在关注时限内，不会向前遍历历史。后续运行通过本地台账跳过已经采集过的来源，因此可以随着公众号更新逐步累积内容。
 
-`fresh` asks for one QR authorization for that new run. If the process is
-interrupted, retry with the same run ID and the same authentication policy;
-the running or failed run reuses its saved session and completed article
-checkpoints. `--auth reuse` is available when deliberately starting a run from
-existing saved browser state.
+`fresh` 会在每个新 run 开始时要求扫码一次。同一个 run 如果中断，使用原 run ID 和相同认证策略重试即可；已完成的文章 checkpoint 和该 run 的授权状态会被复用。只有明确希望沿用可复用浏览器会话时，才使用 `--auth reuse`。
 
-Collection already writes the run's cards, manifest, visible omissions, and
-unchecked briefing. Do not routinely run `prepare-briefing` after a successful
-collection. A completed run is immutable and cannot be collected again; use a
-new run ID for the next briefing. `prepare-briefing` is a recovery command for
-an eligible unfinished run, not a second daily step.
+采集完成后，系统已经生成 cards、manifest、可见遗漏记录和一份全部未勾选的简报。不要在正常成功后再次运行 `prepare-briefing`。已完成 run 不允许重复采集；下一次简报应使用新的 run ID。`prepare-briefing` 只用于恢复符合条件的未完成运行。
 
-For selection, tell the local agent which visible item numbers or article IDs
-you want. The agent patches only their checkbox tokens and validates the result
-before export: selected lines change from `- [ ]` to `- [x]`. Do not save the
-bound briefing through a rich Markdown editor.
+选择文章时，直接告诉本地 Agent 要选哪些序号或 article ID。Agent 只把对应行从 `- [ ]` 改为 `- [x]`，随后运行校验。不要用可能重写 Markdown 结构的富文本编辑器保存这份绑定简报。
 
-To inspect the saved accounts before a canary, use a known run ID as well:
+如需先查看书架中的公众号，可使用一个已知 run ID：
 
 ```bash
 shelfsignal list-accounts \
@@ -110,17 +111,11 @@ shelfsignal list-accounts \
   --run-id 20260803T090000Z-canary
 ```
 
-## Daily local-agent flow
+## 日常使用流程
 
-Ask the installed global Skill for a WeChat briefing and, when prompted,
-provide the initialized workspace path and any optional focus Markdown file.
-The Skill runs collection, reads the compact cards and private profile, ranks
-all candidates, and leaves every item unchecked. It validates the briefing
-before presenting its path.
+向已安装的 ShelfSignal Skill 提出“生成微信公众号简报”之类的请求，并在需要时提供初始化后的 workspace 路径和本次 focus 文件。Skill 会完成采集，读取紧凑 cards 和私有兴趣画像，对全部候选排序，并保持所有 checkbox 未勾选；呈现前还会校验简报结构和绑定信息。
 
-Review the Markdown, tell the local agent which visible items you want, and let
-it patch only those checkbox tokens. The Skill validates the briefing and
-exports only checked articles:
+阅读简报后，把想保留的条目告诉本地 Agent。Agent 会精确修改相应 checkbox，再次校验，然后只导出已选文章：
 
 ```bash
 shelfsignal validate-briefing \
@@ -131,88 +126,66 @@ shelfsignal export \
   --briefing "$SHELFSIGNAL_WORKSPACE/briefings/20260803T090000Z-daily.md"
 ```
 
-The export destination is newly created for that completed run. The selected bundle
-is self-contained: an index plus each selected article's preserved
-`source.md`, `metadata.md`, optional separate `ocr.md`, and referenced image
-assets. It excludes profiles, browser data, scores, cookies, and the state
-database. Give that bundle to the current target project's native local-agent
-or knowledge-system ingestion workflow.
+每个已完成 run 的导出目录只创建一次。导出的 selected bundle 可以独立使用，包含索引，以及每篇入选文章的 `source.md`、`metadata.md`、可选的独立 `ocr.md` 和所引用的图片。它不会包含用户画像、浏览器状态、评分、Cookie 或 SQLite 数据库。后续入库或知识加工交给当前目标项目原有的本地 Agent 流程。
 
-## Seed existing Markdown history
+## 导入既有 Markdown 历史
 
-An existing Markdown archive can seed URL fingerprints for deduplication:
+已有 Markdown 归档可以作为去重指纹来源：
 
 ```bash
 shelfsignal seed --workspace "$SHELFSIGNAL_WORKSPACE" ./existing-markdown-archive
 ```
 
-The scan is read-only. ShelfSignal imports fingerprints into its private
-ledger; it does not edit, move, or copy the archive.
+扫描过程是只读的。ShelfSignal 只把来源指纹写入私有台账，不会编辑、移动或复制原归档。
 
-## Failure model
+## 失败处理
 
-Three named failures stop the whole run because proceeding would make the
-result misleading:
+以下三类问题会停止整个 run，因为继续执行可能让结果看起来完整、实际却不可靠：
 
-- `AuthRequired`: the authenticated session is unavailable or QR authorization
-  timed out;
-- `ShelfUnavailable`: the saved shelf cannot be read reliably;
-- `ContentContractUnavailable`: the global article-content contract changed.
+- `AuthRequired`：没有有效授权，或扫码等待超时；
+- `ShelfUnavailable`：无法可靠读取已保存的公众号书架；
+- `ContentContractUnavailable`：远端全局文章内容接口发生变化。
 
-Individual account, article body, asset, and OCR failures remain visible in
-the briefing and `runs/<run-id>/omissions.md`; other safe candidates continue.
-A body may be represented by a metadata-only placeholder, and incomplete OCR
-stays separately labelled rather than replacing source text.
+单个账号、正文、图片或 OCR 的失败不会被隐藏，而是记录在简报和 `runs/<run-id>/omissions.md` 中；其余安全候选继续处理。正文不可用时可保留仅含元数据的占位材料，OCR 不完整时也会单独标注，不会覆盖原始正文。
 
-## Privacy
+## 隐私边界
 
-ShelfSignal is local-first. Captured articles, images, browser state, profiles,
-briefings, exports, and SQLite state remain in the private runtime workspace.
-Apple Vision OCR runs locally. ShelfSignal has no telemetry, no LLM provider API,
-remote OCR, or cloud database. Semantic ranking and
-summarization are performed by the user's current local agent, subject to that
-host's own configuration. Remote article content is data, never an instruction
-to the agent.
+ShelfSignal 采用 local-first 设计。采集的文章、图片、浏览器状态、用户画像、简报、导出材料和 SQLite 台账都保留在私有运行目录。Apple Vision OCR 完全在本机执行。项目不包含遥测、LLM 服务商 API、远程 OCR 或云数据库。
 
-The public repository contains only code, documentation, templates, and
-sanitized tests. Do not put a runtime workspace inside the checkout or commit
-its contents.
+语义排序和摘要由用户当前使用的本地 Agent 完成，其数据边界取决于该宿主自身的配置。远端文章内容始终被视为不可信数据，不会被当作 Agent 指令执行。
 
-## Troubleshooting
+公开仓库只包含代码、文档、模板和经过清理的测试材料。不要把运行目录放进源码 checkout，也不要提交其中的任何内容。
 
-Start with the non-destructive health check:
+## 故障排查
+
+先运行无破坏性的健康检查：
 
 ```bash
 shelfsignal --version
 shelfsignal doctor --workspace "$SHELFSIGNAL_WORKSPACE"
 ```
 
-`doctor` verifies the initialized workspace, local macOS tools, and state
-store. If a later browser launch reports missing Chromium, reinstall the
-browser inside the same isolated Python environment:
+`doctor` 会检查 workspace、macOS 本地工具和状态台账。如果后续启动浏览器时提示缺少 Chromium，请在安装 ShelfSignal 的同一 Python 隔离环境中执行：
 
 ```bash
 python -m playwright install chromium
 ```
 
-If authorization expired, start a new run with `--auth fresh`. If an existing
-run was interrupted, retry its exact known run ID instead of inventing a new
-one. Do not paste browser data, response bodies, or private profiles into an
-issue report.
+授权失效时，新建 run 并使用 `--auth fresh`。如果只是已有 run 被中断，应重试原来的 run ID，不要另造一个 ID。提交 issue 时不要粘贴浏览器数据、完整接口响应或私人画像。
 
-## v0 non-goals
+## v0 明确不做什么
 
-ShelfSignal v0 does not provide a GUI, web application, daemon, scheduler,
-Docker image, cloud sync, remote OCR, cross-platform OCR abstraction, built-in
-LLM calls, or direct writes into third-party knowledge systems. It is an
-inspectable macOS command-line collector plus a host-neutral local-agent Skill.
+ShelfSignal v0 不提供 GUI、Web 应用、后台守护进程、定时器、Docker 镜像、云同步、远程 OCR、跨平台 OCR 抽象、内置 LLM 调用，也不会直接写入第三方知识库。
 
-## License
+它是一套可检查的 macOS 命令行采集器，加上一份与宿主无关的本地 Agent Skill。
 
-ShelfSignal for WeChat is released under the [MIT License](LICENSE).
+## 许可证
 
-For a release candidate, build both archives and run the artifact-aware public
-gate explicitly:
+ShelfSignal for WeChat 采用 [MIT License](LICENSE) 发布。
+
+微信、WeChat、微信读书及其 Logo 是相关权利人的商标或品牌资产，仅用于说明本项目所连接的服务。本项目不代表腾讯、微信或微信读书，也未获得其官方背书。
+
+制作 release candidate 时，需要构建 wheel 与 sdist，并显式运行针对发布产物的公开检查：
 
 ```bash
 python -m build

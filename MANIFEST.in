@@ -1,2 +1,3 @@
-include README.zh-CN.md
+include README.en.md
+recursive-include docs/assets *.png
 include tests/release_audit.py

@@ -19,8 +19,29 @@ def test_public_repository_has_no_private_or_runtime_artifacts() -> None:
     assert audit_repository(ROOT) == ()
 
 
-def test_readme_documents_the_complete_public_workflow() -> None:
+def test_default_readme_is_chinese_and_links_to_english() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    required_claims = (
+        "从微信读书书架采集微信公众号文章",
+        "README.en.md",
+        "docs/assets/wechat-logo.png",
+        "docs/assets/weread-logo.png",
+        "与腾讯、微信及微信读书不存在官方关联",
+        "快速开始",
+        "工作流程",
+        "隐私边界",
+    )
+    for claim in required_claims:
+        assert claim in readme, claim
+
+    assert not (ROOT / "README.zh-CN.md").exists()
+    assert (ROOT / "README.en.md").is_file()
+    assert (ROOT / "docs/assets/wechat-logo.png").is_file()
+    assert (ROOT / "docs/assets/weread-logo.png").is_file()
+
+
+def test_english_readme_documents_the_complete_public_workflow() -> None:
+    readme = (ROOT / "README.en.md").read_text(encoding="utf-8")
     required_claims = (
         "Local-first WeChat Official Account article collection for local AI agents.",
         "Python 3.11",
