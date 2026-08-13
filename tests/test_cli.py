@@ -10,7 +10,6 @@ import shelfsignal.cli as cli_module
 from shelfsignal.briefing import (
     initial_run_bindings,
     read_run_manifest,
-    selected_ids,
     validate_briefing,
 )
 from shelfsignal.cli import (
@@ -20,6 +19,7 @@ from shelfsignal.cli import (
     process_client_run,
     write_omissions,
 )
+from shelfsignal.content import article_dir_name
 from shelfsignal.errors import (
     AuthRequired,
     ContentContractUnavailable,
@@ -47,7 +47,6 @@ def test_public_command_surface() -> None:
         "collect",
         "prepare-briefing",
         "validate-briefing",
-        "export",
     )
 
 
@@ -173,7 +172,7 @@ def test_validate_rejects_symlinked_briefing(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fake_end_to_end_rerun_digest_validation_and_checked_export(
+async def test_fake_end_to_end_rerun_digest_validation_and_local_sources(
     tmp_path: Path, fake_article_client: object
 ) -> None:
     paths = initialize_workspace(tmp_path / "runtime")
@@ -194,15 +193,19 @@ async def test_fake_end_to_end_rerun_digest_validation_and_checked_export(
     manifest = paths.runs_dir / "run-001" / "manifest.md"
     bindings = read_run_manifest(manifest)
     assert bindings == initial_run_bindings(text)
-    assert validate_briefing(text, bindings, require_unchecked=True) == (
-        "article-image",
+    assert validate_briefing(text, bindings) == (
         "article-text",
+        "article-image",
+        "article-old",
     )
-    assert text.count("- [ ] **Select**") == 2
-    assert fake_article_client.content_calls == 2
-    assert len(list(paths.library_dir.iterdir())) == 2
+    assert text.count("### Briefing") == 3
+    assert "对哪一篇文章感兴趣？" in text
+    assert fake_article_client.content_calls == 3
+    assert len(list(paths.library_dir.iterdir())) == 3
     assert (paths.runs_dir / "run-001" / "cards.md").exists()
-    assert (paths.library_dir / "article-image" / "ocr.md").read_text(
+    assert (
+        paths.library_dir / article_dir_name("article-image") / "ocr.md"
+    ).read_text(
         encoding="utf-8"
     ).endswith("recognized fictional text\n")
 
@@ -216,37 +219,32 @@ async def test_fake_end_to_end_rerun_digest_validation_and_checked_export(
         evidence_probe=lambda path: ImageEvidence(path, 1200, 8000),
         ocr_runner=lambda path: "recognized fictional text",
     )
-    assert fake_article_client.content_calls == 2
+    assert fake_article_client.content_calls == 3
 
-    checked = text.replace("- [ ] **Select**", "- [x] **Select**", 1)
-    briefing.write_text(checked, encoding="utf-8")
-    assert selected_ids(checked, bindings) == ("article-image",)
+    summarized = text.replace(
+        "- Summary: Awaiting host-agent summary",
+        "- Summary: Fictional summary",
+    ).replace(
+        "- Key points: Awaiting host-agent summary",
+        "- Key points: Fictional point",
+    )
+    briefing.write_text(summarized, encoding="utf-8")
     assert main(
         ["validate-briefing", "--workspace", str(paths.root), str(briefing)]
     ) == 0
-    assert main(
-        ["export", "--workspace", str(paths.root), "--briefing", str(briefing)]
-    ) == 0
-    destination = paths.exports_dir / "run-001-selected"
-    assert sorted(path.name for path in (destination / "articles").iterdir()) == [
-        "article-image"
-    ]
 
-    wrong_header = checked.replace(
+    wrong_header = summarized.replace(
         "# WeChat briefing · run-001", "# WeChat briefing · run-other"
     )
     briefing.write_text(wrong_header, encoding="utf-8")
     assert main(
         ["validate-briefing", "--workspace", str(paths.root), str(briefing)]
     ) == 1
-    assert main(
-        ["export", "--workspace", str(paths.root), "--briefing", str(briefing)]
-    ) == 1
 
-    tampered = checked.replace('Title: "Image article"', 'Title: "Edited title"')
+    tampered = summarized.replace('Title: "Image article"', 'Title: "Edited title"')
     briefing.write_text(tampered, encoding="utf-8")
     assert main(
-        ["export", "--workspace", str(paths.root), "--briefing", str(briefing)]
+        ["validate-briefing", "--workspace", str(paths.root), str(briefing)]
     ) == 1
 
 
@@ -300,7 +298,9 @@ def test_prepare_run_fails_closed_when_any_stored_article_is_corrupt(
     manifest = paths.runs_dir / "run-001" / "manifest.md"
     briefing_before = briefing.read_bytes()
     manifest_before = manifest.read_bytes()
-    (paths.library_dir / "article-text" / "source.md").write_text(
+    (
+        paths.library_dir / article_dir_name("article-text") / "source.md"
+    ).write_text(
         "corrupt", encoding="utf-8"
     )
 

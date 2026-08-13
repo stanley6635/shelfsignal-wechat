@@ -5,7 +5,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta, timezone
+from datetime import UTC, datetime
 from html import unescape
 from html.parser import HTMLParser
 from typing import Protocol
@@ -27,7 +27,7 @@ SHELF_URL = "https://weread.qq.com/web/shelf"
 COVER_URL = "https://weread.qq.com/web/mp/cover"
 MP_CONTENT_URL = "https://weread.qq.com/web/mp/content"
 BOOKREAD_URL = "https://weread.qq.com/web/mp/articles"
-_LOOKBACK_TZ = timezone(timedelta(hours=8))
+ARTICLES_PER_ACCOUNT = 3
 MAX_ASSET_BYTES = 25 * 1024 * 1024
 MAX_ARTICLE_HTML_BYTES = 25 * 1024 * 1024
 SHELF_RENDER_TIMEOUT_MS = 30_000
@@ -96,10 +96,19 @@ class _LatestSeed:
 class PlaywrightWeReadClient:
     coverage_warning = None
 
-    def __init__(self, context: BrowserContext, page: Page, *, lookback_days: int = 2):
+    def __init__(
+        self,
+        context: BrowserContext,
+        page: Page,
+        *,
+        lookback_days: int | None = None,
+    ):
         self.context = context
         self.page = page
-        self._lookback_days = lookback_days
+        # Kept as an internal compatibility argument for callers from v0.1;
+        # collection is now governed by the fixed three-article window.
+        _ = lookback_days
+        self.coverage_warning: str | None = None
         self._latest_by_account: dict[str, _LatestSeed] = {}
         self._content_by_article: dict[str, ArticleContent] = {}
         self._review_by_article: dict[str, str] = {}
@@ -192,8 +201,16 @@ class PlaywrightWeReadClient:
                 return articles
         except AuthRequired:
             raise
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 - visible fallback preserves partial results
+            self.coverage_warning = (
+                "latest-three list unavailable; collected the latest article only "
+                "for one or more accounts"
+            )
+            return await self._articles_from_cover(account)
+        self.coverage_warning = (
+            "latest-three list unavailable; collected the latest article only "
+            "for one or more accounts"
+        )
         return await self._articles_from_cover(account)
 
     async def _articles_from_bookread(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
@@ -201,10 +218,9 @@ class PlaywrightWeReadClient:
         # /book/articles endpoint requires client-side skey/vid headers and
         # returns -2012 (登录超时) for browser cookies, so the web API is
         # used instead: GET /web/mp/articles?bookId=MP_WXS_xxx&offset=N
-        cutoff = _lookback_cutoff(self._lookback_days)
         articles: list[RemoteArticle] = []
         offset = 0
-        max_pages = 5  # up to 100 articles, more than enough for lookback window
+        max_pages = 5  # bounded defensive pagination; normally returns on page one
         while offset < max_pages * 20:
             response = await self.context.request.get(
                 BOOKREAD_URL,
@@ -222,7 +238,6 @@ class PlaywrightWeReadClient:
             reviews = payload.get("reviews")
             if not isinstance(reviews, list) or not reviews:
                 break
-            page_has_recent = False
             for item in reviews:
                 if not isinstance(item, dict):
                     continue
@@ -251,19 +266,13 @@ class PlaywrightWeReadClient:
                     published_at = datetime.fromtimestamp(publish_time, tz=UTC)
                 except (OverflowError, OSError, ValueError):
                     continue
-                if published_at >= cutoff:
-                    page_has_recent = True
-                else:
-                    # articles are in reverse chronological order;
-                    # once we pass the cutoff, stop this page
-                    continue
                 # mpInfo has no mp.weixin.qq.com URL; fetch content to
                 # resolve the real source URL for dedup.
                 source_url = ""
                 try:
                     content = await self._fetch_content(article_id, article_id)
                     _, source_url = parse_latest_html_metadata(content.html)
-                except Exception:
+                except Exception:  # noqa: BLE001 - body retrieval reports later per article
                     source_url = ""
                 articles.append(RemoteArticle(
                     article_id=article_id,
@@ -273,9 +282,8 @@ class PlaywrightWeReadClient:
                     source_url=source_url,
                     published_at=published_at,
                 ))
-            if not page_has_recent and articles:
-                # all remaining pages are older than cutoff
-                break
+                if len(articles) == ARTICLES_PER_ACCOUNT:
+                    return tuple(articles)
             if len(reviews) < 20:
                 break
             offset += 20
@@ -724,16 +732,6 @@ def parse_article_content(payload: object) -> ArticleContent:
     if not isinstance(images, list) or not all(isinstance(item, str) for item in images):
         raise ContentContractUnavailable("article image list has changed type")
     return ArticleContent(article_id, body, tuple(dict.fromkeys(images)))
-
-
-def _lookback_cutoff(lookback_days: int) -> datetime:
-    """Cutoff at the start of (today - lookback_days + 1) in Beijing time.
-
-    lookback_days=2 → yesterday 00:00 Beijing time → "前一天 0 点到今天".
-    """
-    now_local = datetime.now(_LOOKBACK_TZ)
-    today_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
-    return today_start - timedelta(days=max(lookback_days - 1, 0))
 
 
 def parse_book_read(

@@ -6,22 +6,20 @@
 
 <h1 align="center">ShelfSignal for WeChat</h1>
 
-<p align="center"><strong>从微信读书书架采集微信公众号文章，生成可筛选、可交付的本地 Markdown 简报。</strong></p>
+<p align="center"><strong>从微信读书书架采集公众号全文，生成可继续深聊的本地 Markdown 简报。</strong></p>
 
 <p align="center">
   <strong>简体中文</strong> · <a href="README.en.md">English</a>
 </p>
 
-<p align="center"><code>Local-first</code> · <code>全文与图片</code> · <code>本地 OCR</code> · <code>人工筛选</code> · <code>Agent-ready</code></p>
+<p align="center"><code>Local-first</code> · <code>每账号最新 3 篇</code> · <code>全文与图片</code> · <code>本地 OCR</code> · <code>Agent-ready</code></p>
 
 > [!IMPORTANT]
 > ShelfSignal 是独立开源项目，与腾讯、微信及微信读书不存在官方关联。微信和微信读书名称及 Logo 的相关权利归其权利人所有。
 
 ## 它解决什么问题
 
-微信公众号内容适合阅读，却不容易稳定地沉淀为本地资料。ShelfSignal 利用用户本人授权后的微信读书书架，把公众号文章转成一条短而清晰的本地工作流：采集完整内容、保留图片、必要时执行 OCR、生成全部候选简报，再由用户决定哪些文章值得交给当前 Agent 或知识库继续处理。
-
-它不内置 LLM，不替用户做最终选择，也不把私有内容上传到额外的云服务。
+微信公众号内容适合阅读，却不容易稳定地沉淀为本地资料。ShelfSignal 利用用户本人授权后的微信读书书架，读取每个公众号最新 3 篇文章，保存完整正文与图片，必要时执行本地 OCR，再生成一份简洁的 briefing。看到感兴趣的文章后，直接告诉 Agent 序号或标题，即可基于已经保存在本地的全文继续分析。
 
 ## 核心能力
 
@@ -29,13 +27,13 @@
 | --- | --- |
 | 微信公众号采集 | 从已授权的微信读书书架读取当前可见文章，保存正文与有效图片 |
 | 图片型文章 | 通过 macOS Apple Vision 在本地执行 OCR，派生文本不覆盖原始内容 |
-| 兴趣排序 | 本地 Agent 根据用户画像排序和摘要，但不隐藏候选、不自动勾选 |
-| 安全交付 | 仅导出用户选中的文章，不包含 Cookie、浏览器状态、画像或内部台账 |
+| 简报生成 | 本地 Agent 为每篇新文章生成中性摘要和关键要点 |
+| 继续深聊 | 通过序号或标题定位本地全文，也可点击链接回到微信阅读原文 |
 
 ## 工作流程
 
 ```text
-微信读书扫码授权 → 采集全部候选 → 本地 Agent 排序并生成简报 → 用户勾选 → 导出材料包
+微信读书扫码授权 → 每账号读取最新 3 篇 → 本地去重 → 生成简报 → 基于全文继续聊
 ```
 
 [快速开始](#快速开始) · [日常使用](#日常使用流程) · [隐私边界](#隐私边界) · [故障排查](#故障排查)
@@ -44,11 +42,24 @@
 
 - macOS，并已安装支持 Apple Vision 的系统环境和 Xcode Command Line Tools（需要 `swiftc` 与 `sips`）
 - Python 3.11 或更高版本
-- 微信读书账号，且书架中已保存微信公众号内容
+- 微信读书账号，并已将希望采集的公众号加入书架
 
 v0 仅支持 macOS。源码仓库和下文介绍的私有运行目录必须分开存放。
 
 ## 快速开始
+
+### 先把公众号加入微信读书书架
+
+ShelfSignal 读取的是微信读书书架，不是微信里的公众号关注列表。首次使用前，请对希望采集的公众号逐一完成以下操作：
+
+1. 在微信中打开该公众号的任意一篇文章。
+2. 点击右上角的“…”菜单。
+3. 选择“在微信读书中打开”。
+4. 进入微信读书后，点击“加入书架”。
+
+完成一次后，该公众号会出现在微信读书书架中；后续新文章可由 ShelfSignal 统一采集。
+
+### 安装
 
 建议把 Python 包安装在隔离环境中。以源码安装为例：
 
@@ -74,13 +85,7 @@ shelfsignal doctor --workspace "$SHELFSIGNAL_WORKSPACE"
 
 环境变量只对当前 shell 及其子进程生效。如果希望以后自动加载，可以自行写入 shell 配置；不要把运行目录放进 ShelfSignal 源码仓库或其他 Git 项目。
 
-`init` 会创建浏览器状态、文章库、运行记录、简报、导出目录和一份最小化的 SQLite 台账，同时生成可编辑的 Markdown 用户画像：
-
-- `profile/interests.md`：长期关注和明确不关注的方向；
-- `profile/rubric.md`：评分与判断标准；
-- `profile/focus/`：可选，用于某一次运行的临时关注重点。
-
-这些资料只影响排序、摘要角度和置信度，不会隐藏候选，也不会自动勾选文章。除非用户明确同意，Skill 只读取画像，不会修改它们。
+`init` 会创建浏览器状态、文章库、运行记录、简报目录和一份最小化的 SQLite 台账。正文、图片、OCR 和运行数据都保存在这个私有目录中。
 
 ## 授权与运行周期
 
@@ -90,17 +95,14 @@ shelfsignal doctor --workspace "$SHELFSIGNAL_WORKSPACE"
 shelfsignal collect \
   --workspace "$SHELFSIGNAL_WORKSPACE" \
   --auth fresh \
-  --run-id 20260803T090000Z-daily \
-  --lookback-days 7
+  --run-id 20260813T090000Z-daily
 ```
 
-v0 的微信读书适配器采用 **latest-only** 策略：每个已保存公众号最多读取微信读书当前暴露的一篇文章，不承诺获取历史文章列表。`--lookback-days` 只判断当前文章是否仍在关注时限内，不会向前遍历历史。后续运行通过本地台账跳过已经采集过的来源，因此可以随着公众号更新逐步累积内容。
+每次运行固定检查每个公众号最新 3 篇。首次运行最多交付每账号 3 篇；后续运行通过本地台账跳过已经保存的文章，只把当前窗口内的新文章写入简报。如果微信读书的文章列表暂时不可用，系统会保留仍可读取的最新一篇，并在简报中明确提示覆盖范围。
 
 `fresh` 会在每个新 run 开始时要求扫码一次。同一个 run 如果中断，使用原 run ID 和相同认证策略重试即可；已完成的文章 checkpoint 和该 run 的授权状态会被复用。只有明确希望沿用可复用浏览器会话时，才使用 `--auth reuse`。
 
-采集完成后，系统已经生成 cards、manifest、可见遗漏记录和一份全部未勾选的简报。不要在正常成功后再次运行 `prepare-briefing`。已完成 run 不允许重复采集；下一次简报应使用新的 run ID。`prepare-briefing` 只用于恢复符合条件的未完成运行。
-
-选择文章时，直接告诉本地 Agent 要选哪些序号或 article ID。Agent 只把对应行从 `- [ ]` 改为 `- [x]`，随后运行校验。不要用可能重写 Markdown 结构的富文本编辑器保存这份绑定简报。
+采集完成后，系统已经生成 cards、manifest、可见遗漏记录和 briefing。不要在正常成功后再次运行 `prepare-briefing`。已完成 run 不允许重复采集；下一次简报应使用新的 run ID。`prepare-briefing` 只用于恢复符合条件的未完成运行。
 
 如需先查看书架中的公众号，可使用一个已知 run ID：
 
@@ -113,20 +115,17 @@ shelfsignal list-accounts \
 
 ## 日常使用流程
 
-向已安装的 ShelfSignal Skill 提出“生成微信公众号简报”之类的请求，并在需要时提供初始化后的 workspace 路径和本次 focus 文件。Skill 会完成采集，读取紧凑 cards 和私有兴趣画像，对全部候选排序，并保持所有 checkbox 未勾选；呈现前还会校验简报结构和绑定信息。
+向已安装的 ShelfSignal Skill 提出“生成微信公众号简报”之类的请求，并在需要时提供初始化后的 workspace 路径。Skill 会完成采集，为每篇新文章生成摘要和关键要点，并在呈现前校验简报结构和文章绑定信息。
 
-阅读简报后，把想保留的条目告诉本地 Agent。Agent 会精确修改相应 checkbox，再次校验，然后只导出已选文章：
+阅读简报后，直接告诉 Agent 感兴趣的序号或标题。Agent 会定位该文章已经保存在本地的 `source.md` 和可选 `ocr.md`，继续做解释、比较、提炼或讨论。每篇简报也保留原文链接，方便在微信中获得原生阅读体验。
+
+需要单独检查简报完整性时，可运行：
 
 ```bash
 shelfsignal validate-briefing \
   --workspace "$SHELFSIGNAL_WORKSPACE" \
   "$SHELFSIGNAL_WORKSPACE/briefings/20260803T090000Z-daily.md"
-shelfsignal export \
-  --workspace "$SHELFSIGNAL_WORKSPACE" \
-  --briefing "$SHELFSIGNAL_WORKSPACE/briefings/20260803T090000Z-daily.md"
 ```
-
-每个已完成 run 的导出目录只创建一次。导出的 selected bundle 可以独立使用，包含索引，以及每篇入选文章的 `source.md`、`metadata.md`、可选的独立 `ocr.md` 和所引用的图片。它不会包含用户画像、浏览器状态、评分、Cookie 或 SQLite 数据库。后续入库或知识加工交给当前目标项目原有的本地 Agent 流程。
 
 ## 导入既有 Markdown 历史
 
@@ -150,9 +149,9 @@ shelfsignal seed --workspace "$SHELFSIGNAL_WORKSPACE" ./existing-markdown-archiv
 
 ## 隐私边界
 
-ShelfSignal 采用 local-first 设计。采集的文章、图片、浏览器状态、用户画像、简报、导出材料和 SQLite 台账都保留在私有运行目录。Apple Vision OCR 完全在本机执行。项目不包含遥测、LLM 服务商 API、远程 OCR 或云数据库。
+ShelfSignal 采用 local-first 设计。采集的文章、图片、浏览器状态、简报和 SQLite 台账都保留在私有运行目录。Apple Vision OCR 完全在本机执行。项目不包含遥测、LLM 服务商 API、远程 OCR 或云数据库。
 
-语义排序和摘要由用户当前使用的本地 Agent 完成，其数据边界取决于该宿主自身的配置。远端文章内容始终被视为不可信数据，不会被当作 Agent 指令执行。
+摘要和后续分析由用户当前使用的本地 Agent 完成，其数据边界取决于该宿主自身的配置。远端文章内容始终被视为不可信数据，不会被当作 Agent 指令执行。
 
 公开仓库只包含代码、文档、模板和经过清理的测试材料。不要把运行目录放进源码 checkout，也不要提交其中的任何内容。
 
@@ -172,12 +171,6 @@ python -m playwright install chromium
 ```
 
 授权失效时，新建 run 并使用 `--auth fresh`。如果只是已有 run 被中断，应重试原来的 run ID，不要另造一个 ID。提交 issue 时不要粘贴浏览器数据、完整接口响应或私人画像。
-
-## v0 明确不做什么
-
-ShelfSignal v0 不提供 GUI、Web 应用、后台守护进程、定时器、Docker 镜像、云同步、远程 OCR、跨平台 OCR 抽象、内置 LLM 调用，也不会直接写入第三方知识库。
-
-它是一套可检查的 macOS 命令行采集器，加上一份与宿主无关的本地 Agent Skill。
 
 ## 许可证
 

@@ -24,20 +24,18 @@ from .briefing import (
     create_briefing_shell,
     initial_run_bindings,
     read_run_manifest,
-    selected_ids,
     validate_briefing,
     write_run_manifest,
 )
 from .cards import build_card, write_cards
-from .collector import MAX_LOOKBACK_DAYS, collect_articles
+from .collector import collect_articles
 from .content import (
-    atomic_write,
     article_dir_name,
+    atomic_write,
     ensure_safe_directory,
     load_stored_article,
 )
 from .errors import ShelfSignalError
-from .exporter import ExportError, export_selected
 from .models import ArticleStatus, CollectionOmission, StoredArticle
 from .ocr import ImageEvidence, ensure_helper, image_evidence, ocr_article, run_vision_ocr
 from .seed import SeedError, seed_markdown_archive
@@ -149,7 +147,6 @@ def build_parser() -> argparse.ArgumentParser:
     collect = commands.add_parser("collect")
     collect.add_argument("--workspace", type=Path, required=True)
     collect.add_argument("--auth", choices=("fresh", "reuse"), default="fresh")
-    collect.add_argument("--lookback-days", type=int, default=7)
     collect.add_argument("--run-id")
     collect.add_argument("--account", action="append", default=[])
 
@@ -161,9 +158,6 @@ def build_parser() -> argparse.ArgumentParser:
     validate.add_argument("--workspace", type=Path, required=True)
     validate.add_argument("briefing", type=Path)
 
-    export = commands.add_parser("export")
-    export.add_argument("--workspace", type=Path, required=True)
-    export.add_argument("--briefing", type=Path, required=True)
     return parser
 
 
@@ -493,7 +487,13 @@ def prepare_run(paths: WorkspacePaths, store: StateStore, run_id: str) -> Path:
         load_stored_article(paths.library_dir / article_dir_name(article_id))
         for article_id in store.article_ids_for_run(run_id)
     )
-    card_tuple = tuple(build_card(item) for item in stored)
+    card_tuple = tuple(
+        sorted(
+            (build_card(item) for item in stored),
+            key=lambda card: (card.published_at, card.article_id),
+            reverse=True,
+        )
+    )
     write_cards(card_tuple, run_dir / "cards.md")
     shell = create_briefing_shell(run_id, card_tuple, tuple(warnings))
     bindings = initial_run_bindings(shell)
@@ -507,7 +507,7 @@ async def process_client_run(
     paths: WorkspacePaths,
     store: StateStore,
     client: ArticleClient,
-    lookback_days: int,
+    lookback_days: int | None,
     run_id: str,
     helper: Path,
     evidence_probe: Callable[[Path], ImageEvidence] = image_evidence,
@@ -574,13 +574,11 @@ async def process_client_run(
 async def collect_run(
     paths: WorkspacePaths,
     auth_policy: AuthPolicy,
-    lookback_days: int,
+    lookback_days: int | None,
     run_id: str,
     account_ids: set[str] | None = None,
 ) -> Path:
     run_id = _usable_run_id(run_id)
-    if type(lookback_days) is not int or not 0 <= lookback_days <= MAX_LOOKBACK_DAYS:
-        raise ValueError(f"lookback days must be between 0 and {MAX_LOOKBACK_DAYS}")
     with _run_lease(paths, run_id):
         return await _collect_run_locked(
             paths, auth_policy, lookback_days, run_id, account_ids
@@ -590,7 +588,7 @@ async def collect_run(
 async def _collect_run_locked(
     paths: WorkspacePaths,
     auth_policy: AuthPolicy,
-    lookback_days: int,
+    lookback_days: int | None,
     run_id: str,
     account_ids: set[str] | None,
 ) -> Path:
@@ -611,7 +609,7 @@ async def _collect_run_locked(
     try:
         async with authenticated_context(paths.browser_dir, run_id, auth_policy) as context:
             page = context.pages[0] if context.pages else await context.new_page()
-            client = PlaywrightWeReadClient(context, page, lookback_days=lookback_days)
+            client = PlaywrightWeReadClient(context, page)
             briefing = await process_client_run(
                 paths,
                 store,
@@ -666,7 +664,7 @@ def dispatch(args: argparse.Namespace) -> int:
             collect_run(
                 paths,
                 AuthPolicy(args.auth),
-                args.lookback_days,
+                None,
                 run_id,
                 account_ids,
             )
@@ -691,22 +689,8 @@ def dispatch(args: argparse.Namespace) -> int:
             max_bytes=_MAX_BRIEFING_BYTES,
         )
         _validate_briefing_run_header(markdown, run_id)
-        validate_briefing(markdown, bindings, require_unchecked=False)
+        validate_briefing(markdown, bindings)
         print("valid")
-        return 0
-    if args.command == "export":
-        run_id, briefing = _briefing_context(paths, args.briefing)
-        bindings = read_run_manifest(paths.runs_dir / run_id / "manifest.md")
-        markdown = _read_private_text(
-            briefing,
-            paths.briefings_dir,
-            label="briefing",
-            max_bytes=_MAX_BRIEFING_BYTES,
-        )
-        _validate_briefing_run_header(markdown, run_id)
-        validate_briefing(markdown, bindings, require_unchecked=False)
-        destination = paths.exports_dir / f"{run_id}-selected"
-        print(export_selected(selected_ids(markdown, bindings), paths.library_dir, destination))
         return 0
     raise ValueError("a command is required")
 
@@ -714,7 +698,6 @@ def dispatch(args: argparse.Namespace) -> int:
 _PUBLIC_ERRORS = (
     ShelfSignalError,
     BriefingError,
-    ExportError,
     SeedError,
     StateError,
     WorkspaceError,

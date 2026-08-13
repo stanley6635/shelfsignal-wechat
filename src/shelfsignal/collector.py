@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
@@ -25,31 +25,28 @@ from .models import (
 )
 from .weread import ArticleClient
 
-MAX_LOOKBACK_DAYS = 36_500
+ARTICLES_PER_ACCOUNT = 3
 _MAX_REASON_LENGTH = 500
 
 
 async def collect_articles(
     client: ArticleClient,
     library_dir: Path,
-    lookback_days: int,
+    lookback_days: int | None,
     run_id: str,
     is_known: Callable[[str], bool] | None = None,
     on_stored: Callable[[StoredArticle], None] | None = None,
     account_ids: set[str] | None = None,
 ) -> CollectionResult:
-    _validate_collection_inputs(lookback_days, run_id)
+    _ = lookback_days
+    _validate_collection_inputs(run_id)
     library_dir = ensure_safe_directory(library_dir)
-    cutoff = datetime.now(UTC) - timedelta(days=lookback_days)
     stored: list[StoredArticle] = []
     omissions: list[CollectionOmission] = []
     seen_article_ids: set[str] = set()
     seen_source_urls: set[str] = set()
 
     accounts = await client.shelf()
-    coverage_warning = getattr(client, "coverage_warning", None)
-    if isinstance(coverage_warning, str) and coverage_warning.strip():
-        omissions.append(CollectionOmission("coverage", run_id, coverage_warning.strip()))
     if account_ids:
         available = {account.account_id for account in accounts}
         for missing in sorted(account_ids - available):
@@ -67,15 +64,16 @@ async def collect_articles(
             )
             continue
 
-        for article in sorted(articles, key=_article_sort_key):
+        newest = sorted(articles, key=_article_sort_key, reverse=True)[
+            :ARTICLES_PER_ACCOUNT
+        ]
+        for article in newest:
             try:
-                published_at = _published_at_utc(article)
+                _published_at_utc(article)
             except (TypeError, ValueError) as exc:
                 omissions.append(
                     CollectionOmission("article", article.article_id, _failure_reason(exc))
                 )
-                continue
-            if published_at < cutoff:
                 continue
             if article.article_id in seen_article_ids or article.source_url in seen_source_urls:
                 continue
@@ -97,6 +95,9 @@ async def collect_articles(
             if on_stored is not None:
                 on_stored(item)
 
+    coverage_warning = getattr(client, "coverage_warning", None)
+    if isinstance(coverage_warning, str) and coverage_warning.strip():
+        omissions.append(CollectionOmission("coverage", run_id, coverage_warning.strip()))
     return CollectionResult(tuple(stored), tuple(omissions))
 
 
@@ -224,9 +225,7 @@ def _stored_artifacts_present(directory: Path) -> bool:
     return False
 
 
-def _validate_collection_inputs(lookback_days: int, run_id: str) -> None:
-    if type(lookback_days) is not int or not 0 <= lookback_days <= MAX_LOOKBACK_DAYS:
-        raise ValueError(f"lookback_days must be between 0 and {MAX_LOOKBACK_DAYS}")
+def _validate_collection_inputs(run_id: str) -> None:
     if not isinstance(run_id, str) or not run_id.strip() or len(run_id) > 128:
         raise ValueError("run_id must be non-empty and at most 128 characters")
 

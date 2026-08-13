@@ -47,14 +47,6 @@ class FakeClient:
                 "https://example.invalid/recent",
                 now,
             ),
-            RemoteArticle(
-                "article-old",
-                account.account_id,
-                account.name,
-                "Old",
-                "https://example.invalid/old",
-                now - timedelta(days=30),
-            ),
         )
 
     async def content(self, article):
@@ -66,29 +58,74 @@ class FakeClient:
 
 
 @pytest.mark.asyncio
-async def test_collector_applies_window_and_records_complete_article(tmp_path: Path):
+async def test_collector_uses_fixed_article_window_without_date_filter(tmp_path: Path):
+    class OldArticleClient(FakeClient):
+        async def articles(self, account):
+            articles = await super().articles(account)
+            return articles + (
+                RemoteArticle(
+                    "article-old",
+                    account.account_id,
+                    account.name,
+                    "Old",
+                    "https://example.invalid/old",
+                    datetime.now(UTC) - timedelta(days=30),
+                ),
+            )
+
     result = await collect_articles(
-        client=FakeClient(),
+        client=OldArticleClient(),
         library_dir=tmp_path / "library",
         lookback_days=7,
         run_id="run-001",
     )
-    assert [item.article.article_id for item in result.stored] == ["article-1"]
+    assert [item.article.article_id for item in result.stored] == [
+        "article-1",
+        "article-old",
+    ]
     assert result.stored[0].status is ArticleStatus.COMPLETE
     assert result.omissions == ()
 
 
 @pytest.mark.asyncio
-async def test_collector_exposes_latest_only_coverage_warning(tmp_path: Path):
+async def test_collector_exposes_reduced_coverage_warning(tmp_path: Path):
     client = FakeClient()
-    client.coverage_warning = "latest-only: historical articles are not traversed"
+    client.coverage_warning = "latest-three list unavailable; latest article only"
     result = await collect_articles(client, tmp_path / "library", 7, "run-001")
     assert any(
         item.scope == "coverage"
         and item.identifier == "run-001"
-        and item.reason.startswith("latest-only:")
+        and item.reason.startswith("latest-three")
         for item in result.omissions
     )
+
+
+@pytest.mark.asyncio
+async def test_collector_caps_each_account_at_latest_three(tmp_path: Path):
+    class FourArticleClient(FakeClient):
+        async def articles(self, account):
+            now = datetime.now(UTC)
+            return tuple(
+                RemoteArticle(
+                    f"article-{index}",
+                    account.account_id,
+                    account.name,
+                    f"Article {index}",
+                    f"https://example.invalid/{index}",
+                    now - timedelta(days=index),
+                )
+                for index in range(4)
+            )
+
+    result = await collect_articles(
+        FourArticleClient(), tmp_path / "library", 7, "run-001"
+    )
+
+    assert [item.article.article_id for item in result.stored] == [
+        "article-0",
+        "article-1",
+        "article-2",
+    ]
 
 
 @pytest.mark.asyncio

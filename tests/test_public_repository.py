@@ -22,7 +22,7 @@ def test_public_repository_has_no_private_or_runtime_artifacts() -> None:
 def test_default_readme_is_chinese_and_links_to_english() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     required_claims = (
-        "从微信读书书架采集微信公众号文章",
+        "从微信读书书架采集公众号全文",
         "README.en.md",
         "docs/assets/wechat-logo.png",
         "docs/assets/weread-logo.png",
@@ -50,15 +50,12 @@ def test_english_readme_documents_the_complete_public_workflow() -> None:
         'export SHELFSIGNAL_WORKSPACE="$HOME/ShelfSignal-Data"',
         "current shell",
         "outside any Git repository",
-        "profile/interests.md",
-        "profile/rubric.md",
-        "profile/focus/",
+        "在微信读书中打开",
+        "latest three articles",
         "--auth fresh",
         "--auth reuse",
         "--run-id",
-        "- [ ]",
-        "- [x]",
-        "selected bundle",
+        "stored `source.md`",
         "read-only",
         "AuthRequired",
         "ShelfUnavailable",
@@ -67,7 +64,6 @@ def test_english_readme_documents_the_complete_public_workflow() -> None:
         "no telemetry",
         "no LLM provider API",
         "shelfsignal doctor",
-        "v0 non-goals",
         "MIT License",
         "SHELFSIGNAL_REQUIRE_DIST=1 python -m pytest -q tests/test_public_repository.py",
     )
@@ -77,7 +73,7 @@ def test_english_readme_documents_the_complete_public_workflow() -> None:
     assert "Collection already writes" in readme
     assert "completed run is immutable" in readme
     assert "Do not routinely run `prepare-briefing`" in readme
-    assert "newly created for that completed run" in readme
+    assert "item number or title" in readme
 
 
 def test_package_metadata_and_shipped_resources_are_public_ready() -> None:

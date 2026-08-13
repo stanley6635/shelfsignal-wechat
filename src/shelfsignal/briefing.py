@@ -18,12 +18,11 @@ from .models import ReadingCard
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}\Z")
 _ID_LINE = re.compile(r"<!-- shelfsignal:id=([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127}) -->\Z")
 _DIGEST_LINE = re.compile(r"<!-- shelfsignal:digest=([0-9a-f]{64}) -->\Z")
-_CHECK_LINE = re.compile(r"- \[([ xX])\] \*\*Select\*\*\Z")
 _MANIFEST_ITEM = re.compile(
     r"- `([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})` sha256:([0-9a-f]{64})\Z"
 )
 _RUN_HEADER = re.compile(r"# WeChat briefing · ([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})\Z")
-_ARTICLE_HEADER = re.compile(r"## Article · `([A-Za-z0-9][A-Za-z0-9_.:~-]{0,127})`\Z")
+_ARTICLE_HEADER = re.compile(r"## ([1-9][0-9]*)\. (.+)\Z")
 _FENCE_OPEN = re.compile(r"^ {0,3}(`{3,}|~{3,}).*$")
 _DNS_LABEL = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\Z")
 _MAX_CARDS = 2_000
@@ -68,6 +67,11 @@ def _markdown_string(value: str) -> str:
         .replace("<", "\\u003c")
         .replace(">", "\\u003e")
     )
+
+
+def _markdown_heading(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"([`*_{}\[\]()#+.!|~-])", r"\\\1", escaped)
 
 
 def _utc_instant(value: datetime) -> datetime:
@@ -133,7 +137,7 @@ def create_briefing_shell(
     lines = [
         f"# WeChat briefing · {run_id}",
         "",
-        "Every candidate is visible. Ranking never preselects an article.",
+        "以下是本次发现的新文章。每篇全文均已保存在本地，可继续交给 Agent 分析。",
         "",
     ]
     if warnings:
@@ -144,7 +148,7 @@ def create_briefing_shell(
         )
         lines.append("")
 
-    for card in cards:
+    for item_number, card in enumerate(cards, start=1):
         title = _bounded_text(card.title, _MAX_TITLE_CHARACTERS, "title")
         account = _bounded_text(
             card.account_name, _MAX_ACCOUNT_CHARACTERS, "account name"
@@ -173,27 +177,35 @@ def create_briefing_shell(
         digest = _canonical_digest(card.article_id, values, excerpt)
         lines.extend(
             [
-                f"## Article · `{card.article_id}`",
+                f"## {item_number}. {_markdown_heading(title)}",
                 f"<!-- shelfsignal:id={card.article_id} -->",
                 f"<!-- shelfsignal:digest={digest} -->",
-                "- [ ] **Select**",
                 f"- Title: {_markdown_string(title)}",
                 f"- Account: {_markdown_string(account)}",
                 f"- Published: {_markdown_string(published)}",
                 f"- Source: {_markdown_string(source_url)}",
                 f"- Retrieval: {_markdown_string(retrieval)}",
                 f"- OCR: {_markdown_string(ocr)}",
+                f"- Read original: [阅读原文]({source_url})",
                 "",
                 f"- Evidence: {_markdown_string(excerpt)}",
                 "",
-                "### Agent ranking",
+                "### Briefing",
                 "",
-                "- Summary: Awaiting host-agent ranking",
-                "- Reason: Awaiting host-agent ranking",
-                "- Confidence: Awaiting host-agent ranking",
+                "- Summary: Awaiting host-agent summary",
+                "- Key points: Awaiting host-agent summary",
                 "",
             ]
         )
+
+    lines.extend(
+        [
+            "---",
+            "",
+            "对哪一篇文章感兴趣？告诉我序号或标题，我们可以基于已保存的全文继续聊。",
+            "你也可以点击「阅读原文」，获得微信公众号中的完整阅读体验。",
+        ]
+    )
 
     result = "\n".join(lines).rstrip() + "\n"
     if len(result.encode("utf-8")) > _MAX_BRIEFING_BYTES:
@@ -224,10 +236,10 @@ _VISIBLE_FIELDS = (
     ("OCR", _MAX_STATUS_CHARACTERS),
 )
 _ARTICLE_CONTROL_PREFIXES = (
-    "## Article",
     "<!-- shelfsignal:id=",
     "<!-- shelfsignal:digest=",
     "- Evidence",
+    "- Read original",
     *tuple(f"- {label}" for label, _ in _VISIBLE_FIELDS),
 )
 
@@ -236,7 +248,7 @@ def _looks_like_article_control(line: str) -> bool:
     stripped = line.lstrip()
     return bool(
         stripped.startswith(_ARTICLE_CONTROL_PREFIXES)
-        or _CHECK_LINE.fullmatch(stripped)
+        or _ARTICLE_HEADER.fullmatch(stripped)
     )
 
 
@@ -321,7 +333,7 @@ def _parse_evidence(line: str) -> str:
     return value
 
 
-def _id_checks(markdown: str) -> tuple[tuple[str, str, str], ...]:
+def _id_checks(markdown: str) -> tuple[tuple[str, str], ...]:
     if not isinstance(markdown, str):
         raise BriefingError("briefing must be text")
     if len(markdown.encode("utf-8")) > _MAX_BRIEFING_BYTES:
@@ -335,31 +347,29 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str, str], ...]:
     _reject_raw_html(lines)
     _reject_wrapped_controls(lines)
 
-    pairs: list[tuple[str, str, str]] = []
+    pairs: list[tuple[str, str]] = []
     canonical_indices: set[int] = set()
+    expected_item_number = 1
     for index, line in enumerate(lines):
-        if not line.startswith("## Article"):
-            continue
         header = _ARTICLE_HEADER.fullmatch(line)
         if header is None:
-            raise BriefingError("malformed article section header")
+            continue
+        if int(header.group(1)) != expected_item_number:
+            raise BriefingError("briefing item numbers must be sequential")
+        expected_item_number += 1
         if index + 13 >= len(lines):
             raise BriefingError("incomplete canonical article section")
         hidden = _ID_LINE.fullmatch(lines[index + 1])
         if hidden is None:
             raise BriefingError("article header is not followed by a hidden ID")
-        if header.group(1) != hidden.group(1):
-            raise BriefingError("article header and hidden ID differ")
         digest_match = _DIGEST_LINE.fullmatch(lines[index + 2])
         if digest_match is None:
             raise BriefingError("article ID is not followed by a canonical digest")
-        check = _CHECK_LINE.fullmatch(lines[index + 3])
-        if check is None:
-            raise BriefingError("article digest and checkbox must be adjacent")
-
         values: dict[str, str] = {}
-        for offset, (label, limit) in enumerate(_VISIBLE_FIELDS, start=4):
+        for offset, (label, limit) in enumerate(_VISIBLE_FIELDS, start=3):
             values[label] = _parse_json_field(lines[index + offset], label, limit)
+        if header.group(2) != _markdown_heading(values["Title"]):
+            raise BriefingError("article heading and Title field differ")
         try:
             published = datetime.fromisoformat(values["Published"])
         except ValueError as exc:
@@ -367,24 +377,26 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str, str], ...]:
         _utc_instant(published)
         if not _safe_source_url(values["Source"]):
             raise BriefingError("malformed Source field: expected safe HTTPS URL")
+        if lines[index + 9] != f"- Read original: [阅读原文]({values['Source']})":
+            raise BriefingError("missing or altered original article link")
         if lines[index + 10] != "":
             raise BriefingError("missing separator before Evidence field")
         evidence = _parse_evidence(lines[index + 11])
         recomputed = _canonical_digest(hidden.group(1), values, evidence)
         if digest_match.group(1) != recomputed:
             raise BriefingError(f"canonical payload digest mismatch: {hidden.group(1)}")
-        if lines[index + 12] != "" or lines[index + 13] != "### Agent ranking":
-            raise BriefingError("missing canonical Agent ranking section")
+        if lines[index + 12] != "" or lines[index + 13] != "### Briefing":
+            raise BriefingError("missing canonical Briefing section")
 
         canonical_indices.update(range(index, index + 12))
-        pairs.append((hidden.group(1), check.group(1), digest_match.group(1)))
+        pairs.append((hidden.group(1), digest_match.group(1)))
         if len(pairs) > _MAX_CARDS:
             raise BriefingError(f"too many article controls; maximum is {_MAX_CARDS}")
 
     for index, line in enumerate(lines):
         if index in canonical_indices:
             continue
-        if _CHECK_LINE.fullmatch(line) or _ID_LINE.fullmatch(line) or _DIGEST_LINE.fullmatch(line):
+        if _ID_LINE.fullmatch(line) or _DIGEST_LINE.fullmatch(line):
             raise BriefingError("article control is not attached to a canonical article")
         if _looks_like_article_control(line):
             raise BriefingError("decoy or duplicate article field/control")
@@ -394,11 +406,10 @@ def _id_checks(markdown: str) -> tuple[tuple[str, str, str], ...]:
 def validate_briefing(
     markdown: str,
     expected_bindings: Mapping[str, str],
-    require_unchecked: bool,
 ) -> tuple[str, ...]:
     expected = _expected_bindings(expected_bindings)
     pairs = _id_checks(markdown)
-    ids = [article_id for article_id, _, _ in pairs]
+    ids = [article_id for article_id, _ in pairs]
     duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
     missing = sorted(set(expected) - set(ids))
     invented = sorted(set(ids) - set(expected))
@@ -410,24 +421,12 @@ def validate_briefing(
         raise BriefingError(f"missing IDs: {missing}")
     mismatched = sorted(
         article_id
-        for article_id, _, digest in pairs
+        for article_id, digest in pairs
         if expected.get(article_id) != digest
     )
     if mismatched:
         raise BriefingError(f"manifest digest mismatch: {mismatched}")
-    if require_unchecked and any(mark.lower() == "x" for _, mark, _ in pairs):
-        raise BriefingError("initial briefing contains a checked item")
     return tuple(ids)
-
-
-def selected_ids(markdown: str, expected_bindings: Mapping[str, str]) -> tuple[str, ...]:
-    """Return checked IDs only after validating against manifest-derived IDs."""
-    validate_briefing(markdown, expected_bindings, require_unchecked=False)
-    return tuple(
-        article_id
-        for article_id, mark, _ in _id_checks(markdown)
-        if mark.lower() == "x"
-    )
 
 
 def initial_run_bindings(markdown: str) -> dict[str, str]:
@@ -435,15 +434,15 @@ def initial_run_bindings(markdown: str) -> dict[str, str]:
 
     Task 13 integration contract: call this immediately after
     ``create_briefing_shell``, persist the result with ``write_run_manifest``,
-    and later pass only ``read_run_manifest`` output to ``validate_briefing``
-    and ``selected_ids``. Never regenerate bindings from an edited briefing.
+    and later pass only ``read_run_manifest`` output to ``validate_briefing``.
+    Never regenerate bindings from an edited briefing.
     """
     pairs = _id_checks(markdown)
-    ids = [article_id for article_id, _, _ in pairs]
+    ids = [article_id for article_id, _ in pairs]
     duplicates = sorted(item for item, count in Counter(ids).items() if count > 1)
     if duplicates:
         raise BriefingError(f"duplicate IDs: {duplicates}")
-    return {article_id: digest for article_id, _, digest in pairs}
+    return {article_id: digest for article_id, digest in pairs}
 
 
 def write_run_manifest(bindings: Mapping[str, str], path: Path) -> Path:

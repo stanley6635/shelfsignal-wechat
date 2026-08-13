@@ -4,9 +4,9 @@
 
 ShelfSignal for WeChat is a local-first WeChat Official Account article
 collector. It captures full text and images through the user's authenticated
-WeRead session, applies local OCR when needed, produces interest-ranked
-Markdown briefings, and exports selected articles for processing by the
-current local AI agent or knowledge system.
+WeRead session, applies local OCR when needed, and produces concise Markdown
+briefings that the current local AI agent can continue discussing from the
+stored full text.
 
 Repository name: `shelfsignal-wechat`
 
@@ -18,11 +18,10 @@ Skill name: `shelfsignal-wechat`
 
 - Optimize for a short, inspectable local workflow rather than a platform.
 - Keep deterministic work in code: authentication checks, collection,
-  validation, deduplication, OCR, Markdown generation, and export.
-- Use the host agent only for semantic ranking, summarization, and explicit
-  downstream handoff.
-- Show every candidate. Interest profiles affect ordering and guidance only;
-  they never hide or preselect articles.
+  validation, deduplication, OCR, and Markdown generation.
+- Use the host agent only for summarization and explicit follow-up analysis.
+- Inspect at most the latest three articles exposed for each saved account;
+  local deduplication keeps later briefings focused on unseen articles.
 - Prefer visible partial results over batch failure. Stop only when
   authentication fails, the shelf cannot be read, or the global article
   content contract is unavailable.
@@ -33,7 +32,7 @@ Skill name: `shelfsignal-wechat`
 - The repository contains code, tests, documentation, templates, and fictional
   examples only.
 - Real user interests, browser state, cookies, article content, OCR output,
-  briefings, exports, and SQLite state belong in a separate runtime workspace.
+  briefings and SQLite state belong in a separate runtime workspace.
 - Never place secrets, authentication material, personal interest profiles, or
   captured article content in Git, fixtures, logs, screenshots, or examples.
 - Do not add telemetry, remote OCR, a cloud database, or an LLM provider API
@@ -49,8 +48,7 @@ Skill name: `shelfsignal-wechat`
 - Python's built-in `sqlite3` stores only minimal, reconstructible run state:
   stable IDs, hashes, statuses, and timestamps.
 - Apple Vision OCR is invoked through a thin Swift helper on macOS.
-- Markdown is the user-facing format for profiles, focus notes, briefings,
-  source packages, and exports.
+- Markdown is the user-facing format for briefings and stored source packages.
 - The shipped global Skill orchestrates the CLI from the user's current target
   project. The source repository is not the normal daily-use entrypoint.
 
@@ -64,8 +62,6 @@ Skill name: `shelfsignal-wechat`
   already completed ID/hash pairs.
 - A historical Markdown seed is read-only: it may import fingerprints but must
   not edit, move, or copy the scanned archive.
-- Exports contain selected articles only and exclude cookies, browser data,
-  profiles, scores, and internal state.
 
 ## Project structure
 

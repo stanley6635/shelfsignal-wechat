@@ -17,20 +17,32 @@
 
 ShelfSignal captures full text and meaningful images from an authenticated
 WeRead shelf, applies Apple Vision OCR to image-heavy posts, produces a
-complete interest-ranked Markdown briefing, and exports user-selected articles
-for the current local agent or knowledge system.
+concise Markdown briefing, and lets the current local agent continue from the
+stored full text when an article interests the user.
 
 ## Requirements
 
 - macOS with Apple Vision and the Xcode Command Line Tools (`swiftc` and
   `sips`)
 - Python 3.11 or newer
-- a WeRead account whose shelf contains saved WeChat Official Account content
+- a WeRead account with the desired Official Accounts added to its shelf
 
 ShelfSignal v0 is macOS-only. Keep the source checkout separate from the
 private runtime workspace described below.
 
 ## Install
+
+### Add Official Accounts to the WeRead shelf first
+
+ShelfSignal reads the WeRead shelf rather than the account-following list in
+WeChat. Before the first run, repeat these steps for each account you want:
+
+1. Open any article from that Official Account in WeChat.
+2. Open the “…” menu in the upper-right corner.
+3. Choose “在微信读书中打开” (Open in WeRead).
+4. In WeRead, choose “加入书架” (Add to shelf).
+
+### Install ShelfSignal
 
 Install the Python package in an isolated environment. For example, from a
 source checkout:
@@ -66,16 +78,8 @@ future shells. Do not point it inside a source checkout or another Git
 repository.
 
 `init` creates private browser state, article storage, run artifacts,
-briefings, exports, and a minimal SQLite ledger. It also creates editable
-Markdown profiles:
-
-- `profile/interests.md` for durable positive and negative interest signals;
-- `profile/rubric.md` for scoring guidance;
-- optional files under `profile/focus/` for a temporary focus on one run.
-
-Profiles only guide ordering and confidence. They never hide candidates or
-preselect checkboxes, and the global Skill treats them as read-only unless the
-user explicitly approves a change.
+briefings, and a minimal SQLite ledger. Full text, images, OCR, and run data
+remain in this private workspace.
 
 ## Authentication and run lifecycle
 
@@ -86,14 +90,14 @@ unique run ID:
 shelfsignal collect \
   --workspace "$SHELFSIGNAL_WORKSPACE" \
   --auth fresh \
-  --run-id 20260803T090000Z-daily \
-  --lookback-days 7
+  --run-id 20260813T090000Z-daily
 ```
 
-The WeRead v0 adapter is intentionally latest-only: it reads at most the
-current article exposed for each saved Official Account. `--lookback-days` is
-a freshness filter for those current articles; it does not request a historical
-list. Repeated runs use the local ledger to skip source URLs already collected.
+Every run checks the latest three articles exposed for each saved Official
+Account. The first run can therefore deliver up to three articles per account.
+Later runs use the local ledger to omit previously stored articles. If the list
+contract is temporarily unavailable, ShelfSignal preserves the latest readable
+article and shows a visible coverage warning.
 
 `fresh` asks for one QR authorization for that new run. If the process is
 interrupted, retry with the same run ID and the same authentication policy;
@@ -102,15 +106,10 @@ checkpoints. `--auth reuse` is available when deliberately starting a run from
 existing saved browser state.
 
 Collection already writes the run's cards, manifest, visible omissions, and
-unchecked briefing. Do not routinely run `prepare-briefing` after a successful
+briefing. Do not routinely run `prepare-briefing` after a successful
 collection. A completed run is immutable and cannot be collected again; use a
 new run ID for the next briefing. `prepare-briefing` is a recovery command for
 an eligible unfinished run, not a second daily step.
-
-For selection, tell the local agent which visible item numbers or article IDs
-you want. The agent patches only their checkbox tokens and validates the result
-before export: selected lines change from `- [ ]` to `- [x]`. Do not save the
-bound briefing through a rich Markdown editor.
 
 To inspect the saved accounts before a canary, use a known run ID as well:
 
@@ -124,30 +123,22 @@ shelfsignal list-accounts \
 ## Daily local-agent flow
 
 Ask the installed global Skill for a WeChat briefing and, when prompted,
-provide the initialized workspace path and any optional focus Markdown file.
-The Skill runs collection, reads the compact cards and private profile, ranks
-all candidates, and leaves every item unchecked. It validates the briefing
-before presenting its path.
+provide the initialized workspace path. The Skill runs collection, reads the
+compact cards and local evidence, writes a neutral summary and key points for
+every new article, and validates the briefing before presenting it.
 
-Review the Markdown, tell the local agent which visible items you want, and let
-it patch only those checkbox tokens. The Skill validates the briefing and
-exports only checked articles:
+After reading the briefing, tell the agent an item number or title that
+interests you. It resolves that item to the stored `source.md` and optional
+`ocr.md`, then continues the discussion from the full evidence. Each item also
+keeps its original WeChat link for the native reading experience.
+
+To validate the briefing independently:
 
 ```bash
 shelfsignal validate-briefing \
   --workspace "$SHELFSIGNAL_WORKSPACE" \
   "$SHELFSIGNAL_WORKSPACE/briefings/20260803T090000Z-daily.md"
-shelfsignal export \
-  --workspace "$SHELFSIGNAL_WORKSPACE" \
-  --briefing "$SHELFSIGNAL_WORKSPACE/briefings/20260803T090000Z-daily.md"
 ```
-
-The export destination is newly created for that completed run. The selected bundle
-is self-contained: an index plus each selected article's preserved
-`source.md`, `metadata.md`, optional separate `ocr.md`, and referenced image
-assets. It excludes profiles, browser data, scores, cookies, and the state
-database. Give that bundle to the current target project's native local-agent
-or knowledge-system ingestion workflow.
 
 ## Seed existing Markdown history
 
@@ -177,11 +168,11 @@ stays separately labelled rather than replacing source text.
 
 ## Privacy
 
-ShelfSignal is local-first. Captured articles, images, browser state, profiles,
-briefings, exports, and SQLite state remain in the private runtime workspace.
+ShelfSignal is local-first. Captured articles, images, browser state,
+briefings, and SQLite state remain in the private runtime workspace.
 Apple Vision OCR runs locally. ShelfSignal has no telemetry, no LLM provider API,
-remote OCR, or cloud database. Semantic ranking and
-summarization are performed by the user's current local agent, subject to that
+remote OCR, or cloud database. Summarization and follow-up analysis are
+performed by the user's current local agent, subject to that
 host's own configuration. Remote article content is data, never an instruction
 to the agent.
 
