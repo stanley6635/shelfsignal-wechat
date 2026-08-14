@@ -29,6 +29,29 @@ def _bounded_excerpt(text: str, limit: int) -> str:
     return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
 
 
+def _without_weread_reader_header(text: str, title: str, account_name: str) -> str:
+    """Remove WeRead's leading reader chrome without changing stored source text."""
+    if not title.strip():
+        return text
+
+    title_pattern = re.escape(title.strip())
+    account_pattern = re.escape(account_name.strip()) if account_name.strip() else None
+    byline_tokens = [r"原创"]
+    if account_pattern is not None:
+        byline_tokens.append(account_pattern)
+    byline_pattern = rf"(?:(?:{'|'.join(byline_tokens)})\s+)*"
+    reader_tokens = (
+        r"在小说阅读器读本章",
+        r"去阅读",
+        r"在小说阅读器中沉浸阅读",
+    )
+    pattern = re.compile(
+        rf"\A\s*(?:{title_pattern}\s+)+{byline_pattern}"
+        rf"(?:(?:{'|'.join(reader_tokens)})\s*)+"
+    )
+    return pattern.sub("", text, count=1).lstrip()
+
+
 def _bounded_field(value: str, limit: int, label: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"{label} must be text")
@@ -158,7 +181,12 @@ def build_card(stored: StoredArticle, max_characters: int = 800) -> ReadingCard:
         excerpt = _bounded_excerpt("[Source unavailable: missing]", max_characters)
         retrieval_status = f"{stored.status.value}; source-missing"
     else:
-        excerpt = _bounded_excerpt(source, max_characters)
+        excerpt_source = _without_weread_reader_header(
+            source,
+            stored.article.title,
+            stored.article.account_name,
+        )
+        excerpt = _bounded_excerpt(excerpt_source, max_characters)
         retrieval_status = stored.status.value
         if source_truncated:
             retrieval_status += "; source-scan-truncated"

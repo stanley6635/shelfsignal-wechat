@@ -17,6 +17,7 @@ def make_stored_article(
     *,
     source_text: str = "Compact evidence.",
     title: str | None = None,
+    account_name: str = "Example Account",
     published_at: datetime | None = None,
 ) -> StoredArticle:
     root.mkdir(parents=True, exist_ok=True)
@@ -25,7 +26,7 @@ def make_stored_article(
     article = RemoteArticle(
         article_id,
         "account-1",
-        "Example Account",
+        account_name,
         title or f"Title {article_id}",
         f"https://example.invalid/{article_id}",
         published_at or datetime(2026, 7, 31, tzinfo=UTC),
@@ -50,6 +51,38 @@ def test_card_excerpt_is_bounded(tmp_path: Path):
     assert len(card.excerpt) <= 800
     assert card.article_id == "article-1"
     assert card.excerpt.endswith("…")
+
+
+def test_card_removes_leading_weread_reader_header_from_excerpt(tmp_path: Path):
+    title = "博士伦SeeLuma™获NMPA批准，全数字双筒目镜手术平台正式登陆中国"
+    stored = make_stored_article(
+        tmp_path,
+        "article-1",
+        title=title,
+        account_name="青白视角",
+        source_text=(
+            f"{title}\n\n原创 青白视角 青白视角 青白视角\n\n"
+            "在小说阅读器读本章 去阅读 在小说阅读器中沉浸阅读\n\n"
+            "这是应当保留的正文第一段。"
+        ),
+    )
+
+    card = build_card(stored)
+
+    assert card.excerpt == "这是应当保留的正文第一段。"
+
+
+def test_card_keeps_reader_words_outside_a_matching_header(tmp_path: Path):
+    stored = make_stored_article(
+        tmp_path,
+        "article-1",
+        title="示例标题",
+        source_text="正文建议读者去阅读原始研究，在小说阅读器中沉浸阅读只是后文引语。",
+    )
+
+    card = build_card(stored)
+
+    assert card.excerpt == "正文建议读者去阅读原始研究，在小说阅读器中沉浸阅读只是后文引语。"
 
 
 @pytest.mark.parametrize("limit", [True, 0, -1, 10_001, 1.5, "800"])
