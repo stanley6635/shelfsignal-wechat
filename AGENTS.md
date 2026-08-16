@@ -82,7 +82,11 @@ cross-platform OCR abstraction in v0.
 
 ## Engineering discipline
 
-- Define a verifiable success condition before implementation.
+- Define a verifiable success condition before implementation. Trivial
+  changes (typo fixes, comments, documentation wording, single-line edits
+  with no behavior change) are exempt from the success-condition and
+  plan-approval steps, but the smallest relevant tests still run before
+  handoff.
 - Keep modules narrow and dependency direction simple.
 - Parse remote responses defensively and fail with a named contract error when
   required global fields disappear.
