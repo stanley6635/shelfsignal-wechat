@@ -85,6 +85,50 @@ def test_card_keeps_reader_words_outside_a_matching_header(tmp_path: Path):
     assert card.excerpt == "正文建议读者去阅读原始研究，在小说阅读器中沉浸阅读只是后文引语。"
 
 
+def test_card_removes_multiline_header_with_author_byline(tmp_path: Path):
+    """Regression: bylines usually repeat the author name, which differs from
+    the account name (e.g. 原创 赵泓维 赵泓维 动脉网). Each chrome part sits on
+    its own line in stored source files."""
+    stored = make_stored_article(
+        tmp_path,
+        "article-1",
+        title="新一轮评级即将来临，医疗信息化续命？",
+        account_name="动脉网",
+        source_text=(
+            "新一轮评级即将来临，医疗信息化续命？\n\n"
+            "原创 赵泓维 赵泓维 动脉网\n\n"
+            "在小说阅读器读本章\n\n"
+            "去阅读\n\n"
+            "在小说阅读器中沉浸阅读\n\n"
+            "撰稿 ｜ 赵泓维\n\n"
+            "这是应当保留的正文第一段。"
+        ),
+    )
+
+    card = build_card(stored)
+
+    assert card.excerpt == "撰稿 ｜ 赵泓维 这是应当保留的正文第一段。"
+
+
+def test_card_keeps_header_parts_without_reader_buttons(tmp_path: Path):
+    """Title + byline alone (no reader buttons) is article content, not chrome."""
+    stored = make_stored_article(
+        tmp_path,
+        "article-1",
+        title="示例标题",
+        account_name="示例公众号",
+        source_text=(
+            "示例标题\n\n"
+            "原创 作者甲 作者甲 示例公众号\n\n"
+            "这是应当保留的正文第一段。"
+        ),
+    )
+
+    card = build_card(stored)
+
+    assert card.excerpt == "示例标题 原创 作者甲 作者甲 示例公众号 这是应当保留的正文第一段。"
+
+
 @pytest.mark.parametrize("limit", [True, 0, -1, 10_001, 1.5, "800"])
 def test_card_rejects_malformed_max_characters(tmp_path: Path, limit: object):
     stored = make_stored_article(tmp_path, "article-1")

@@ -29,27 +29,91 @@ def _bounded_excerpt(text: str, limit: int) -> str:
     return compact if len(compact) <= limit else compact[: limit - 1].rstrip() + "…"
 
 
+_WEREAD_READER_TOKENS = (
+    "在小说阅读器读本章",
+    "去阅读",
+    "在小说阅读器中沉浸阅读",
+)
+_BYLINE_MAX_CHARS = 50
+_BYLINE_FORBIDDEN = set("。！？；：，、“”‘’（）《》【】「」—…~～")
+
+
+def _is_weread_reader_line(line: str) -> bool:
+    """True if the line consists solely of reader buttons (any combination)."""
+    stripped = line.strip()
+    if not stripped:
+        return False
+    for token in _WEREAD_READER_TOKENS:
+        stripped = stripped.replace(token, " ")
+    return stripped.strip() == ""
+
+
+def _is_weread_byline_line(line: str) -> bool:
+    """True for short byline lines (name tokens, no sentence punctuation)."""
+    stripped = line.strip()
+    if not stripped or len(stripped) > _BYLINE_MAX_CHARS:
+        return False
+    return not any(char in _BYLINE_FORBIDDEN for char in stripped)
+
+
 def _without_weread_reader_header(text: str, title: str, account_name: str) -> str:
-    """Remove WeRead's leading reader chrome without changing stored source text."""
-    if not title.strip():
+    """Remove WeRead's leading reader chrome without changing stored source text.
+
+    The chrome is a leading block of up to three parts, each possibly on its
+    own line: the repeated title, a byline of short name tokens (e.g.
+    "原创 作者 作者 公众号" — the author name usually differs from the
+    account name), and the reader buttons. The header is only removed when a
+    reader button line is present; otherwise the text is returned unchanged.
+    The account name parameter is retained for API compatibility.
+    """
+    del account_name
+    title_norm = title.strip()
+    if not title_norm:
         return text
 
-    title_pattern = re.escape(title.strip())
-    account_pattern = re.escape(account_name.strip()) if account_name.strip() else None
-    byline_tokens = [r"原创"]
-    if account_pattern is not None:
-        byline_tokens.append(account_pattern)
-    byline_pattern = rf"(?:(?:{'|'.join(byline_tokens)})\s+)*"
-    reader_tokens = (
-        r"在小说阅读器读本章",
-        r"去阅读",
-        r"在小说阅读器中沉浸阅读",
-    )
-    pattern = re.compile(
-        rf"\A\s*(?:{title_pattern}\s+)+{byline_pattern}"
-        rf"(?:(?:{'|'.join(reader_tokens)})\s*)+"
-    )
-    return pattern.sub("", text, count=1).lstrip()
+    lines = text.split("\n")
+    index = 0
+    while index < len(lines) and not lines[index].strip():
+        index += 1
+    if index >= len(lines):
+        return text
+
+    first = lines[index].strip()
+    if title_norm not in first:
+        return text
+    start = index
+    index += 1
+    reader_seen = _is_weread_reader_line(first)
+
+    if not reader_seen:
+        while index < len(lines):
+            line = lines[index].strip()
+            if not line:
+                index += 1
+                continue
+            if _is_weread_reader_line(line):
+                break  # leave reader buttons to the reader loop below
+            if _is_weread_byline_line(line):
+                index += 1
+                continue
+            break
+
+    while index < len(lines):
+        line = lines[index].strip()
+        if not line:
+            index += 1
+            continue
+        if _is_weread_reader_line(line):
+            reader_seen = True
+            index += 1
+            continue
+        break
+
+    if not reader_seen:
+        return text
+    while index > start and not lines[index - 1].strip():
+        index -= 1
+    return "\n".join(lines[index:]).lstrip()
 
 
 def _bounded_field(value: str, limit: int, label: str) -> str:
