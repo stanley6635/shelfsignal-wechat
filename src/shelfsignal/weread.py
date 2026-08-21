@@ -124,7 +124,7 @@ class PlaywrightWeReadClient:
         for attempt in range(2):
             dom_accounts, book_ids = await self._shelf_snapshot()
             if book_ids is None:
-                return dom_accounts
+                return await self._stable_official_accounts(dom_accounts)
             if len(book_ids) == len(dom_accounts):
                 break
             if attempt == 1:
@@ -194,21 +194,36 @@ class PlaywrightWeReadClient:
             raise ShelfUnavailable("saved shelf cover requests could not be read") from exc
         return dom_accounts, parse_cover_book_ids(resource_urls)
 
+    async def _stable_official_accounts(
+        self, first: tuple[ShelfAccount, ...]
+    ) -> tuple[ShelfAccount, ...]:
+        previous_ids = {account.account_id for account in first}
+        for _ in range(2):
+            try:
+                response = await self.page.reload(wait_until="domcontentloaded")
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                raise ShelfUnavailable("saved shelf stability check failed") from exc
+            _validate_shelf_navigation(response, getattr(self.page, "url", ""))
+            current, _ = await self._shelf_snapshot()
+            current_ids = {account.account_id for account in current}
+            if current_ids == previous_ids:
+                return current
+            previous_ids = current_ids
+        raise ShelfUnavailable("saved official-account shelf did not stabilize")
+
     async def articles(self, account: ShelfAccount) -> tuple[RemoteArticle, ...]:
         try:
             articles = await self._articles_from_bookread(account)
-            if articles:
-                return articles
         except AuthRequired:
             raise
         except Exception:  # noqa: BLE001 - visible fallback preserves partial results
-            self.coverage_warning = (
-                "latest-three list unavailable; collected the latest article only "
-                "for one or more accounts"
-            )
-            return await self._articles_from_cover(account)
+            articles = ()
+        if articles:
+            return articles
         self.coverage_warning = (
-            "latest-three list unavailable; collected the latest article only "
+            "latest-three list unavailable; attempted the latest article fallback "
             "for one or more accounts"
         )
         return await self._articles_from_cover(account)
@@ -294,7 +309,12 @@ class PlaywrightWeReadClient:
         if seed is None:
             raise ContentContractUnavailable("latest cover is missing for shelf account")
         content = await self._fetch_content(seed.review_id, seed.article_id)
-        published_at, source_url = parse_latest_html_metadata(content.html)
+        try:
+            published_at, source_url = parse_latest_html_metadata(content.html)
+        except ContentContractUnavailable as exc:
+            raise ArticleBodyUnavailable(
+                f"latest article metadata unavailable for shelf account: {account.account_id}"
+            ) from exc
         return (
             RemoteArticle(
                 article_id=seed.article_id,

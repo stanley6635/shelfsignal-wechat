@@ -1,10 +1,18 @@
+import asyncio
 import json
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from shelfsignal.errors import ContentContractUnavailable, ShelfUnavailable
-from shelfsignal.models import ShelfAccount
+from shelfsignal import weread
+from shelfsignal.errors import (
+    ArticleBodyUnavailable,
+    ContentContractUnavailable,
+    ShelfUnavailable,
+)
+from shelfsignal.models import ArticleContent, RemoteArticle, ShelfAccount
 from shelfsignal.weread import parse_article_content, parse_book_read, parse_shelf_html
 
 
@@ -189,3 +197,96 @@ def test_parse_book_read_rejects_conflicting_duplicate_ids():
             {"chapterInfos": [first, second]},
             ShelfAccount("MP_DEMO_ACCOUNT", "Example Account"),
         )
+
+
+def _make_client() -> weread.PlaywrightWeReadClient:
+    return weread.PlaywrightWeReadClient(context=MagicMock(), page=MagicMock())
+
+
+def _accounts(n: int) -> tuple[ShelfAccount, ...]:
+    return tuple(ShelfAccount(f"MP_WXS_{i:02d}", f"acct-{i}") for i in range(n))
+
+
+def test_stable_official_accounts_waits_for_repeated_snapshot(monkeypatch):
+    monkeypatch.setattr(weread, "_validate_shelf_navigation", lambda *a, **k: None)
+    client = _make_client()
+    client.page.reload = AsyncMock()
+    current = _accounts(3)
+    client._shelf_snapshot = AsyncMock(side_effect=[(current, None), (current, None)])
+    result = asyncio.run(client._stable_official_accounts(current[:1]))
+    assert result == current
+
+
+def test_stable_official_accounts_keeps_stable_shelf(monkeypatch):
+    monkeypatch.setattr(weread, "_validate_shelf_navigation", lambda *a, **k: None)
+    client = _make_client()
+    client.page.reload = AsyncMock()
+    stable = (
+        ShelfAccount("MP_ALPHA", "Alpha"),
+        ShelfAccount("MP_BETA", "Beta"),
+    )
+    client._shelf_snapshot = AsyncMock(return_value=(stable, None))
+    assert asyncio.run(client._stable_official_accounts(stable)) == stable
+    assert client.page.reload.await_count == 1
+
+
+def test_stable_official_accounts_rejects_failed_reload(monkeypatch):
+    monkeypatch.setattr(weread, "_validate_shelf_navigation", lambda *a, **k: None)
+    client = _make_client()
+    client.page.reload = AsyncMock(side_effect=RuntimeError("reload failed"))
+    with pytest.raises(ShelfUnavailable, match="stability check failed"):
+        asyncio.run(client._stable_official_accounts(_accounts(3)))
+
+
+def test_stable_official_accounts_rejects_changing_snapshots(monkeypatch):
+    monkeypatch.setattr(weread, "_validate_shelf_navigation", lambda *a, **k: None)
+    client = _make_client()
+    client.page.reload = AsyncMock()
+    client._shelf_snapshot = AsyncMock(
+        side_effect=[(_accounts(2), None), (_accounts(3), None)]
+    )
+    with pytest.raises(ShelfUnavailable, match="did not stabilize"):
+        asyncio.run(client._stable_official_accounts(_accounts(1)))
+
+
+def test_cover_fallback_reports_missing_article_metadata_per_account():
+    client = _make_client()
+    account = ShelfAccount("MP_WXS_1", "x")
+    client._latest_by_account[account.account_id] = weread._LatestSeed(
+        account, "a1", "r1", "Title"
+    )
+    client._fetch_content = AsyncMock(
+        return_value=ArticleContent("a1", "<p>Body without metadata.</p>", ())
+    )
+    with pytest.raises(ArticleBodyUnavailable, match="MP_WXS_1"):
+        asyncio.run(client._articles_from_cover(account))
+
+
+def test_cover_fallback_preserves_global_contract_failure():
+    client = _make_client()
+    account = ShelfAccount("MP_WXS_1", "x")
+    client._latest_by_account[account.account_id] = weread._LatestSeed(
+        account, "a1", "r1", "Title"
+    )
+    client._fetch_content = AsyncMock(
+        side_effect=ContentContractUnavailable("unexpected endpoint")
+    )
+    with pytest.raises(ContentContractUnavailable, match="unexpected endpoint"):
+        asyncio.run(client._articles_from_cover(account))
+
+
+def test_articles_uses_cover_fallback_and_marks_reduced_coverage():
+    client = _make_client()
+    now = datetime.now(UTC)
+    expected = (
+        RemoteArticle(
+            "a1", "MP_WXS_1", "x", "Title", "https://example.invalid/a1", now
+        ),
+    )
+    client._articles_from_bookread = AsyncMock(return_value=())
+    client._articles_from_cover = AsyncMock(return_value=expected)
+    assert asyncio.run(client.articles(ShelfAccount("MP_WXS_1", "x"))) == expected
+    assert client.coverage_warning == (
+        "latest-three list unavailable; attempted the latest article fallback "
+        "for one or more accounts"
+    )
